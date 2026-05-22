@@ -31,10 +31,18 @@
 
 // Forward declaration for GT911 hardware drain (defined in display_driver.cpp)
 void display_drain_touch();
+void display_buzzer(bool on);
+void display_speaker(bool on);
 
 // ── UART ──────────────────────────────────────────────────────────────────────
-#define FEATHER_BAUD  115200
-#define FeatherPort   Serial0
+// Feather link uses UART1-OUT connector (IO20-TX1 / IO19-RX1). Neither pin
+// conflicts with display GPIOs (3,7,9-14,17,18,21,38-42,45-48).
+// Serial (UART0, GPIO43/44, COM45 via USB-JTAG bridge) = debug output only.
+// Feather side: CROWPANEL_RX_PIN=38 ← IO20(TX1), CROWPANEL_TX_PIN=39 → IO19(RX1).
+#define FEATHER_BAUD    115200
+#define FEATHER_TX_PIN  43     // IO43 = TX0 — shared with CH340K, debug prints go to Feather but are ignored
+#define FEATHER_RX_PIN  44     // IO44 = RX0 — shared with CH340K, Feather telemetry received here
+#define FeatherPort     Serial1
 
 // ── Colour palette ────────────────────────────────────────────────────────────
 #define C_BG          lv_color_hex(0x000000)
@@ -215,8 +223,7 @@ static void sendCmd(const char* cmd, float v) {
 }
 
 // ── Telemetry parser ──────────────────────────────────────────────────────────
-static void parseTelemetry(char* buf) {
-    // Channel objects
+static void parseTelemetry(char* buf) {    // Channel objects
     const char* cKeys[2] = {"c1","c2"};
     for (int i = 0; i < 2; i++) {
         char key[8]; snprintf(key, sizeof(key), "\"%s\":{", cKeys[i]);
@@ -1548,7 +1555,7 @@ void setup() {
     _prefs.begin("warmer_ui", false);
     _brightness = _prefs.getUChar("brt", 200);   // default ~78%
 
-    FeatherPort.begin(FEATHER_BAUD);
+    FeatherPort.begin(FEATHER_BAUD, SERIAL_8N1, FEATHER_RX_PIN, FEATHER_TX_PIN);
 
     display_driver_init();
     buildUI();
