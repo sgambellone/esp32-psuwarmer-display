@@ -270,6 +270,7 @@ void loop() {
                     _bmeGasKohm  = BME680_EMA_ALPHA_SLOW * newGasKohm  + (1.0f - BME680_EMA_ALPHA_SLOW) * _bmeGasKohm;
                 }
             }
+            wifiSrv.setEnv(_bmeTempF, _bmeHumidity, _bmePressHpa, _bmeGasKohm, _bmeSeeded);
             _bmeMeasuring = false;
             _lastBMEms    = now;
         }

@@ -177,6 +177,8 @@ public:
     const char* buffer()     const { return nullptr; }
 
 private:
+    static constexpr uint32_t MAX_LOG_BYTES = 50UL * 1024 * 1024; // 50MB per file (~17hrs)
+    static constexpr uint32_t MIN_FREE_MB   = 100;                 // delete oldest when below
     bool  _enabled;
     int   _rowsTotal;
     int   _fileNum;
@@ -185,10 +187,12 @@ private:
     int   _bufPos        = 0;
     unsigned long _lastFlushMs      = 0;
     unsigned long _flushBusyUntilMs = 0;  // millis() deadline for isBusy()
+    uint32_t      _bytesWritten     = 0;  // bytes written to current file
 
     void _flushToSD() {
         File f = SD.open(_filePath, FILE_APPEND);
         if (f) {
+            _bytesWritten += (uint32_t)_bufPos;
             f.write((const uint8_t*)_ramBuf, _bufPos);
             f.close();
         }
@@ -199,5 +203,49 @@ private:
         // completes, drawing a current spike that can disturb the 3.3V
         // rail and corrupt a simultaneous MAX31865 SPI read.
         _flushBusyUntilMs = _lastFlushMs + 100;
+
+        // Rotate if current file has reached the size limit
+        if (_bytesWritten >= MAX_LOG_BYTES) {
+            Serial.printf("[logger] %s full (%luMB), rotating\n",
+                          _filePath, (unsigned long)(_bytesWritten / (1024*1024)));
+            _openNextFile();
+        }
+    }
+
+    // ── Open next numbered log file, deleting oldest if card is nearly full ──
+    void _openNextFile() {
+        _fileNum++;
+        snprintf(_filePath, sizeof(_filePath), "/log_%03d.csv", _fileNum);
+
+        // If free space is below threshold, delete the oldest file that exists
+        uint64_t freeMB = (SD.totalBytes() - SD.usedBytes()) / (1024*1024);
+        if (freeMB < MIN_FREE_MB) {
+            for (int del = 1; del < _fileNum; del++) {
+                char delPath[32];
+                snprintf(delPath, sizeof(delPath), "/log_%03d.csv", del);
+                if (SD.exists(delPath)) {
+                    SD.remove(delPath);
+                    Serial.printf("[logger] Deleted %s (free was %lluMB)\n",
+                                  delPath, freeMB);
+                    break;  // delete one at a time — rotation will handle the rest
+                }
+            }
+        }
+
+        // Write CSV header to new file
+        File f = SD.open(_filePath, FILE_WRITE);
+        if (f) {
+            f.println("t_ms,c1_tempF,c1_setptF,c1_error,c1_duty,c1_ff,"
+                      "c1_dtdt,c1_status,c2_tempF,c2_setptF,c2_error,"
+                      "c2_duty,c2_ff,c2_dtdt,c2_status,psu_vout,psu_aout,"
+                      "psu_watts,psu_vin,psu_setv,psu_on,psu_cc,"
+                      "env_tempF,env_humidity,env_pressHpa,env_gasKohm");
+            f.close();
+        }
+        _bytesWritten = 0;
+        _rowsTotal    = 0;
+        Serial.printf("[logger] Opened new file: %s (free: ~%lluMB)\n",
+                      _filePath,
+                      (SD.totalBytes() - SD.usedBytes()) / (1024*1024));
     }
 };

@@ -7,18 +7,39 @@
 #include "psu.h"
 
 // =============================================================================
-// WarmWiFiServer — non-blocking HTTP server.
-// Endpoints:
-//   GET  /          → redirect to /dash
-//   GET  /dash      → live dashboard (channels + PSU panel)
-//   GET  /api       → JSON telemetry (channels + PSU)
-//   GET  /status    → plain-text status
-//   GET  /log       → download CSV log
-//   GET  /fftable   → FF table HTML viewer
-//   GET  /diag      → heap / PSRAM / uptime diagnostics
-//   GET  /control   → ch=N&cmd=enable|disable|sp_up|sp_dn
-//                     cmd=psu_on|psu_off|psu_sp_up|psu_sp_dn|psu_sv&v=XX.XX
+// WarmWiFiServer — redesigned to match CrowPanel LVGL UI palette & layout.
+//
+// Changes from previous version:
+//   • Full color palette match: black bg, orange CH accent, CrowPanel exact colors
+//   • 4-tab SPA: Dashboard | PSU | Warmer | Env  (mirrors CrowPanel pages)
+//   • Dashboard: PSU strip (V/A/W/Vin/Set/ON) + two compact channel cards
+//   • PSU page: 4 big readout tiles + preset buttons + adjust row + ON/OFF btn
+//   • Warmer page: two large channel cards (full height)
+//   • Env page: 4 BME680 sensor cards (Temp / Humidity / Pressure / Air Quality)
+//   • EnvData struct + setEnv() — call from main.cpp after each BME680 read
+//   • /api now includes "env" block
+//
+// main.cpp one-line addition:
+//   After bme.endReading() succeeds, add:
+//     wifiSrv.setEnv(_bmeTempF, _bmeHumidity, _bmePressHpa, _bmeGasKohm, _bmeSeeded);
+//
+// Endpoints (unchanged):
+//   GET /dash      → SPA (4 tabs)
+//   GET /api       → JSON telemetry
+//   GET /control   → command endpoint
+//   GET /log       → CSV download
+//   GET /fftable   → FF table
+//   GET /diag      → diagnostics
+//   GET /status    → plain-text
 // =============================================================================
+
+struct EnvData {
+    float tempF    = 0.f;
+    float humidity = 0.f;
+    float pressHpa = 0.f;
+    float gasKohm  = 0.f;
+    bool  valid    = false;
+};
 
 class WarmWiFiServer {
 public:
@@ -28,7 +49,6 @@ public:
           _ch1(nullptr), _ch2(nullptr),
           _reqCount(0), _lastHeartbeatMs(0) {}
 
-    // Call once from main.cpp after WiFi.softAP() is confirmed up.
     void begin() {
         _server.begin();
         _ready = true;
@@ -40,6 +60,15 @@ public:
     void setLogger(WarmLogger* l) { _logger = l; }
     void setPsu(ZkPsu* p)         { _psu = p; }
     bool ready() const            { return _ready; }
+
+    // Called from main.cpp after each successful BME680 endReading().
+    void setEnv(float t, float h, float p, float g, bool valid) {
+        _env.tempF    = t;
+        _env.humidity = h;
+        _env.pressHpa = p;
+        _env.gasKohm  = g;
+        _env.valid    = valid;
+    }
 
     void poll(HeatingChannel* ch1, HeatingChannel* ch2) {
         _ch1 = ch1; _ch2 = ch2;
@@ -104,6 +133,7 @@ private:
     ZkPsu*          _psu;
     HeatingChannel* _ch1;
     HeatingChannel* _ch2;
+    EnvData         _env;
     unsigned long   _reqCount;
     unsigned long   _lastHeartbeatMs;
 
@@ -127,7 +157,6 @@ private:
     void _serveApi(WiFiClient& c) {
         _sendHeaders(c, 200, "application/json");
 
-        // Channel helper lambda (written as a local struct for C++11 compat)
         auto chJson = [&](WiFiClient& cc, HeatingChannel* ch, int n) {
             float tf = isnan(ch->displayTempF) ? -999.0f : ch->displayTempF;
             cc.printf(
@@ -146,11 +175,7 @@ private:
         c.print(",");
         chJson(c, _ch2, 2);
 
-        // PSU block
         if (_psu) {
-            // ok = false as soon as ANY error occurs (errStreak > 0), not just after
-            // the full commsOk threshold. This means the dashboard shows --- and
-            // NO COMM within ~2s of the first timeout rather than ~6s.
             bool psuOk = _psu->commsOk && (_psu->errStreak == 0);
             c.printf(
                 ",\"psu\":{"
@@ -168,7 +193,14 @@ private:
             c.print(",\"psu\":null");
         }
 
-        // Metadata
+        // Env block (BME680) — valid:false when sensor not ready
+        if (_env.valid) {
+            c.printf(",\"env\":{\"t\":%.1f,\"h\":%.1f,\"p\":%.1f,\"g\":%.1f,\"valid\":true}",
+                     _env.tempF, _env.humidity, _env.pressHpa, _env.gasKohm);
+        } else {
+            c.print(",\"env\":{\"valid\":false}");
+        }
+
         bool logOn = _logger && _logger->enabled();
         c.printf(",\"usb\":%s,\"logrows\":%d,\"logkb\":%d}",
                  logOn ? "true" : "false",
@@ -180,7 +212,6 @@ private:
     void _serveControl(WiFiClient& c, const char* req) {
         _sendHeaders(c, 200, "application/json");
 
-        // PSU commands
         if (_psu) {
             if (strstr(req, "cmd=psu_on"))     { _psu->setOutput(true);  c.print("{\"ok\":true}"); return; }
             if (strstr(req, "cmd=psu_off"))    { _psu->setOutput(false); c.print("{\"ok\":true}"); return; }
@@ -192,8 +223,7 @@ private:
             if (sv) { _psu->setVoltage(atof(sv + 13)); c.print("{\"ok\":true}"); return; }
         }
 
-        // Channel commands
-        const char* chPtr = strstr(req, "ch=");
+        const char* chPtr  = strstr(req, "ch=");
         const char* cmdPtr = strstr(req, "cmd=");
         if (!chPtr || !cmdPtr) { c.print("{\"ok\":false}"); return; }
 
@@ -201,7 +231,7 @@ private:
         HeatingChannel* hch = (ch == 1) ? _ch1 : (ch == 2) ? _ch2 : nullptr;
         if (!hch) { c.print("{\"ok\":false}"); return; }
 
-        if (strstr(cmdPtr, "cmd=enable"))  hch->enabled = true;
+        if      (strstr(cmdPtr, "cmd=enable"))  hch->enabled = true;
         else if (strstr(cmdPtr, "cmd=disable")) hch->enabled = false;
         else if (strstr(cmdPtr, "cmd=sp_up"))   hch->adjustSetpoint( TEMP_STEP_F);
         else if (strstr(cmdPtr, "cmd=sp_dn"))   hch->adjustSetpoint(-TEMP_STEP_F);
@@ -235,28 +265,27 @@ private:
         _logger->serveFile(c);
     }
 
-    // ── /fftable — FF table viewer ────────────────────────────────────────────
+    // ── /fftable — feedforward table viewer ───────────────────────────────────
     void _serveFFTable(WiFiClient& c) {
         _sendHeaders(c, 200, "text/html");
         c.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<title>FF Table</title>"
-            "<style>body{font-family:monospace;background:#0d1117;color:#e6edf3;padding:1rem}"
-            "table{border-collapse:collapse}td,th{padding:.2rem .6rem;border:1px solid #30363d}"
-            "th{background:#151b23}tr:nth-child(even){background:#151b23}</style></head>"
-            "<body><h2>Feedforward Learned Table</h2>"));
-        c.print(F("<table><tr><th>Slot</th><th>Setpt (&deg;F)</th>"
+            "<title>FF Table</title><style>"
+            "body{font-family:monospace;background:#000;color:#d0d0d0;padding:1rem}"
+            "h2{color:#ff8040;margin-bottom:.5rem}"
+            "table{border-collapse:collapse;margin-top:.5rem}"
+            "td,th{padding:.25rem .7rem;border:1px solid #444}"
+            "th{background:#282828;color:#909090;letter-spacing:.06em;font-size:.8rem}"
+            "tr:nth-child(even){background:#141414}"
+            "a{color:#55aaff;text-decoration:none;font-size:.85rem}"
+            "</style></head><body>"));
+        c.print(F("<h2>Feedforward Learned Table</h2>"
+            "<p><a href='/dash'>&larr; Dashboard</a></p>"
+            "<table><tr><th>SLOT</th><th>SETPT (&deg;F)</th>"
             "<th>CH1 FF%</th><th>CH2 FF%</th></tr>"));
         for (int s = 0; s < FF_SLOTS; s++) {
             float sp = SETPOINT_MIN_F + s;
-            int sl1 = (int)roundf(sp) - (int)SETPOINT_MIN_F;
-            float ff1 = _ch1 ? _ch1->ffTerm() : 0;
-            float ff2 = _ch2 ? _ch2->ffTerm() : 0;
-            // Note: ffTerm() returns current-setpoint slot; for table view
-            // we display slot values directly
-            (void)sl1; (void)ff1; (void)ff2;
-            c.printf("<tr><td>%d</td><td>%.0f</td>"
-                     "<td>%.1f%%</td><td>%.1f%%</td></tr>",
+            c.printf("<tr><td>%d</td><td>%.0f</td><td>%.1f%%</td><td>%.1f%%</td></tr>",
                      s, sp,
                      _ch1 ? _ch1->ff.getSlot(s)*100.0f : 0.0f,
                      _ch2 ? _ch2->ff.getSlot(s)*100.0f : 0.0f);
@@ -269,11 +298,15 @@ private:
         _sendHeaders(c, 200, "text/html");
         c.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            "<title>Diagnostics</title>"
-            "<style>body{font-family:monospace;background:#0d1117;color:#e6edf3;padding:1rem}"
-            "pre{background:#151b23;padding:.75rem;border-radius:6px}</style>"
-            "</head><body><h2>&#x1F527; Diagnostics</h2><pre id='d'>Loading...</pre>"
-            "<script>"
+            "<title>Diagnostics</title><style>"
+            "body{font-family:monospace;background:#000;color:#d0d0d0;padding:1rem}"
+            "h2{color:#ff8040}pre{background:#1a1a1a;padding:.75rem;"
+            "border-radius:6px;border:1px solid #444;overflow-x:auto}"
+            "a{color:#55aaff;text-decoration:none;font-size:.85rem}"
+            "</style></head><body>"
+            "<h2>&#x1F527; Diagnostics</h2>"
+            "<p><a href='/dash'>&larr; Dashboard</a></p>"
+            "<pre id='d'>Loading...</pre><script>"
             "async function load(){"
             "const r=await fetch('/api');"
             "const d=await r.json();"
@@ -282,316 +315,706 @@ private:
             "</script></body></html>"));
     }
 
-    // ── /dash — main dashboard ────────────────────────────────────────────────
+    // ── /dash — main SPA (4 tabs matching CrowPanel pages) ───────────────────
     void _serveDash(WiFiClient& c) {
         _sendHeaders(c, 200, "text/html");
 
-        // ── HEAD + CSS ─────────────────────────────────────────────────────────
+        // ── HEAD + CSS reset + variables ──────────────────────────────────────
         c.print(F("<!DOCTYPE html><html><head>"
             "<meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             "<title>PSU Warmer</title><style>"
             "*{box-sizing:border-box;margin:0;padding:0}"
-            "body{background:#0d1117;color:#e6edf3;font-family:-apple-system,"
-            "BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;"
-            "flex-direction:column;height:100vh;overflow:hidden}"
-            ":root{--bg:#0d1117;--surf:#151b23;--card:#1a2030;--acc:#58a6ff;"
-            "--grn:#3fb950;--red:#f85149;--amb:#e3b341;"
-            "--txt:#e6edf3;--mut:#8b949e;--dim:#484f58;--bdr:#30363d}"
-            "header{background:var(--surf);border-bottom:1px solid var(--bdr);"
-            "padding:.55rem .9rem;display:flex;align-items:center;"
-            "justify-content:space-between;flex-shrink:0}"
-            "header h1{font-size:1rem;font-weight:600}"
-            ".hicons{display:flex;align-items:center;gap:.75rem}"
-            ".di{display:flex;flex-direction:column;align-items:center;gap:2px}"
-            ".dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}"
-            ".dot.on{background:var(--grn)}.dot.off{background:var(--red)}"
-            ".dlbl{font-size:.55rem;color:var(--mut)}"
-            ".usbtn{padding:.3rem .7rem;border-radius:5px;background:var(--bdr);"
-            "border:none;color:var(--txt);font-size:.8rem;cursor:pointer}"
-            "nav{background:var(--surf);border-bottom:1px solid var(--bdr);"
-            "display:flex;align-items:center;gap:.5rem;"
-            "padding:.4rem .75rem;flex-shrink:0}"
-            "nav a{color:var(--mut);font-size:.78rem;text-decoration:none;"
-            "padding:.25rem .6rem;border-radius:4px}"
-            "nav a.active{color:var(--acc);background:#1a1a2e}"
-            "main{flex:1;overflow-y:auto;padding:1.25rem 1rem;"
-            "display:flex;flex-direction:column;gap:.75rem;align-items:center}"
-            ".ch-row{display:flex;gap:0;justify-content:center;width:100%;"
-            "max-width:640px}"
-            ".zone{width:320px;flex-shrink:0;flex-grow:0;display:flex;"
-            "flex-direction:column;padding:.85rem;gap:.45rem;"
-            "background:var(--card);border:1px solid var(--bdr)}"
-            ".zone:first-child{border-radius:10px 0 0 10px}"
-            ".zone:last-child{border-radius:0 10px 10px 0;border-left:none}"
-            ".zhdr{display:flex;justify-content:space-between;align-items:center}"
-            ".znm{font-size:.7rem;font-weight:700;letter-spacing:.1em;"
-            "color:var(--mut);text-transform:uppercase}"
-            ".onoff{padding:.35rem .9rem;border-radius:6px;font-size:.8rem;"
-            "font-weight:700;border:none;cursor:pointer;min-width:56px}"
-            ".onoff.on{background:#0e2e0e;color:var(--grn);border:1px solid #1a4a1a}"
-            ".onoff.off{background:#1e1e2e;color:var(--mut);border:1px solid var(--bdr)}"
-            ".temp{font-size:3.2rem;font-weight:700;text-align:center;"
-            "color:var(--dim);line-height:1;padding:.15rem 0;flex-shrink:0}"
-            ".temp.live{color:var(--acc)}"
-            ".strow{display:flex;justify-content:space-between;align-items:center}"
-            ".st{font-size:.8rem;font-weight:700;padding:.2rem .55rem;"
-            "border-radius:4px;background:#0d1117;letter-spacing:.04em}"
-            ".st.HEATING{color:#e06030}.st.HOLDING{color:#7fbb7f}"
-            ".st.REDUCING{color:#4488cc}.st.IDLE{color:var(--mut)}"
-            ".st.DISABLED{color:var(--dim)}.st.SENSERR,.st.CUTOFF{color:var(--red)}"
-            ".dtdt{font-size:.7rem;color:var(--mut)}"
-            ".barwrap{background:var(--bdr);border-radius:3px;height:12px;overflow:hidden}"
-            ".barfill{height:100%;width:0%;border-radius:3px;"
-            "transition:width .4s,background-color .4s}"
-            ".brow{display:flex;align-items:center;gap:.5rem}"
-            ".bpct{font-size:.75rem;color:var(--mut);white-space:nowrap;"
-            "min-width:2.8rem;text-align:right}"
-            ".div{height:1px;background:var(--bdr);margin:.1rem 0;flex-shrink:0}"
-            ".tgt{display:flex;flex-direction:column;gap:.3rem;flex:1}"
-            ".tgtlbl{font-size:.7rem;color:var(--mut);text-align:center}"
-            ".tgtrow{display:flex;align-items:center;justify-content:center;gap:.4rem}"
-            ".pm{width:44px;height:44px;border-radius:8px;background:#1a1e2e;"
-            "border:1px solid var(--bdr);color:var(--txt);font-size:1.4rem;"
-            "cursor:pointer;display:flex;align-items:center;justify-content:center}"
-            ".pm:active{background:#252a40}"
-            ".spval{font-size:1.1rem;font-weight:700;color:var(--txt);"
-            "min-width:3rem;text-align:center}"
-            ".ffrow{display:flex;justify-content:space-between;margin-top:auto}"
-            ".fflbl{font-size:.65rem;color:var(--dim)}"));
+            "body{background:#000;color:#fff;"
+            "font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;"
+            "display:flex;flex-direction:column;height:100dvh;overflow:hidden}"
+            ":root{"
+            "--bg:#000;--card:#282828;--tile:#1c1c1c;--bdr:#444;"
+            "--btn:#585858;--bbd:#777;"
+            "--acc:#ff8040;--grn:#33cc66;--txt:#fff;--dim:#909090;"
+            "--mut:#d0d0d0;--red:#ff4444;--blu:#55aaff;--amb:#e3b341;"
+            "--on:#1a3a1a;--on-bd:#1a4a1a;"
+            "--cc:#2e2000;--cc-bd:#4a3000;"
+            "--err:#2e0e0e;--err-bd:#4a1a1a;"
+            "--act:#0d1a2e}"));
 
-        // ── PSU panel CSS ──────────────────────────────────────────────────────
+        // ── Header ────────────────────────────────────────────────────────────
         c.print(F(
-            ".psu-panel{width:100%;max-width:640px;background:var(--card);"
-            "border:1px solid var(--bdr);border-radius:10px;padding:.85rem;"
-            "display:flex;flex-direction:column;gap:.55rem}"
-            ".psu-hdr{display:flex;align-items:center;justify-content:space-between}"
-            ".psu-title{font-size:.7rem;font-weight:700;letter-spacing:.1em;"
-            "color:var(--mut);text-transform:uppercase}"
-            ".psu-tog-btn{padding:.35rem 1rem;border-radius:6px;font-size:.82rem;"
-            "font-weight:700;border:1px solid var(--bdr);cursor:pointer;"
-            "min-width:76px;background:#1e1e2e;color:var(--mut)}"
-            ".psu-tog-btn.on-cv{background:#0e2e0e;color:var(--grn);border-color:#1a4a1a}"
-            ".psu-tog-btn.on-cc{background:#2e2000;color:var(--amb);border-color:#4a3000}"
-            ".psu-tog-btn.fault{background:#2e0e0e;color:var(--red);border-color:#4a1a1a}"
-            ".psu-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:.4rem}"
-            ".psu-metric{display:flex;flex-direction:column;align-items:center;"
-            "background:#0d1117;border-radius:6px;padding:.65rem .2rem}"
-            ".psu-val{font-size:3.4rem;font-weight:700;color:var(--txt);line-height:1}"
-            ".psu-val.c-v{color:var(--grn)}"
-            ".psu-val.c-a{color:var(--amb)}"
-            ".psu-val.c-w{color:var(--red)}"
-            ".psu-unit{font-size:.6rem;color:var(--mut);margin-top:2px}"
-            ".psu-presets{display:grid;grid-template-columns:repeat(9,1fr);gap:.3rem}"
-            ".pv-btn{background:#1a1e2e;border:1px solid var(--bdr);border-radius:4px;"
-            "display:flex;align-items:center;justify-content:center;"
-            "aspect-ratio:3/2;font-size:.75rem;color:var(--txt);cursor:pointer}"
-            ".pv-btn:hover{border-color:var(--acc);color:var(--acc)}"
-            ".pv-btn.active{background:#1a2a3a;border-color:var(--acc);color:var(--acc)}"
-            ".psu-sv-row{display:flex;align-items:center;justify-content:center;gap:.4rem}"
-            ".psu-svlbl{font-size:.7rem;color:var(--mut)}"
-            ".psu-svval{font-size:1.1rem;font-weight:700;min-width:4rem;text-align:center}"
-            ".pm-sm{width:36px;height:36px;border-radius:6px;background:#1a1e2e;"
-            "border:1px solid var(--bdr);color:var(--txt);font-size:1rem;"
-            "cursor:pointer;display:flex;align-items:center;justify-content:center}"
-            ".pm-sm:active{background:#252a40}"
-            "@media(max-width:500px){"
-            ".ch-row{flex-direction:column;align-items:center}"
-            ".zone{width:100%;max-width:380px;border-left:1px solid var(--bdr)}"
-            ".zone:first-child{border-radius:10px 10px 0 0;border-bottom:none}"
-            ".zone:last-child{border-radius:0 0 10px 10px;border-top:none}"
-            ".psu-panel{max-width:380px}"
-            ".psu-metrics{grid-template-columns:repeat(2,1fr)}"
-            ".psu-presets{grid-template-columns:repeat(5,1fr)}}"
+            "header{background:#111;border-bottom:1px solid var(--bdr);"
+            "padding:.45rem .75rem;display:flex;align-items:center;"
+            "justify-content:space-between;flex-shrink:0;gap:.5rem;min-height:46px}"
+            ".htitle{font-size:.88rem;font-weight:700;color:var(--acc);white-space:nowrap;"
+            "letter-spacing:.04em}"
+            ".tabs{display:flex;gap:.3rem;flex-shrink:0}"
+            ".tab{padding:.28rem .65rem;border-radius:5px;background:var(--btn);"
+            "border:1px solid var(--bbd);color:var(--dim);font-size:.73rem;"
+            "cursor:pointer;font-weight:700;letter-spacing:.05em;white-space:nowrap}"
+            ".tab.act{background:var(--act);border-color:var(--blu);color:var(--blu)}"
+            ".envhdr{font-size:.8rem;color:var(--mut);white-space:nowrap;text-align:right;"
+            "min-width:80px}"));
+
+        // ── Page containers ───────────────────────────────────────────────────
+        c.print(F(
+            ".page{display:none;flex:1;overflow-y:auto;padding:.65rem;"
+            "flex-direction:column;gap:.6rem;min-height:0}"
+            ".page.show{display:flex}"));
+
+        // ── Shared: channel card base styles ──────────────────────────────────
+        c.print(F(
+            ".ch-hdr{display:flex;justify-content:space-between;align-items:center}"
+            ".chnm{font-size:.7rem;font-weight:700;letter-spacing:.12em;color:var(--acc)}"
+            ".en-btn{padding:.22rem .55rem;border-radius:4px;background:var(--btn);"
+            "border:1px solid var(--bbd);color:var(--dim);font-size:.72rem;"
+            "font-weight:700;cursor:pointer;min-width:44px}"
+            ".en-btn.on{background:var(--on);border-color:var(--on-bd);color:var(--grn)}"
+            ".ch-stat-row{display:flex;justify-content:space-between;align-items:center}"
+            ".ch-stat{font-size:.75rem;font-weight:700;padding:.14rem .38rem;"
+            "border-radius:3px;background:#000;letter-spacing:.04em}"
+            ".ch-rate{font-size:.68rem;color:var(--dim)}"
+            ".bar-wrap{background:#111;border-radius:3px;height:9px;overflow:hidden}"
+            ".bar{height:100%;width:0%;border-radius:3px;transition:width .4s,background-color .4s}"
+            ".duty-row{display:flex;justify-content:flex-end}"
+            ".duty-pct{font-size:.7rem;color:var(--dim)}"
+            ".divider{height:1px;background:var(--bdr);flex-shrink:0}"
+            ".tgt-lbl{font-size:.62rem;color:var(--dim);text-align:center;"
+            "letter-spacing:.1em;text-transform:uppercase}"
+            ".pm{width:38px;height:38px;border-radius:6px;background:var(--tile);"
+            "border:1px solid var(--bdr);color:var(--txt);font-size:1.25rem;"
+            "cursor:pointer;display:flex;align-items:center;justify-content:center;"
+            "flex-shrink:0;line-height:1}"
+            ".pm:active{background:#333}"
+            ".sp-val{font-size:1.05rem;font-weight:700;min-width:3.4rem;text-align:center}"));
+
+        // ── Dashboard: PSU strip ──────────────────────────────────────────────
+        c.print(F(
+            ".psu-strip{display:flex;gap:.35rem;align-items:stretch;flex-shrink:0;height:68px}"
+            ".stile{flex:1;background:var(--tile);border:1px solid var(--bdr);"
+            "border-radius:6px;display:flex;flex-direction:column;"
+            "align-items:center;justify-content:center;padding:.3rem .15rem;min-width:0}"
+            ".stile.tap{cursor:pointer;border-color:#2a4a7a}"
+            ".stile.tap:active{background:#1a2030}"
+            ".stv{font-size:1.6rem;font-weight:700;line-height:1;white-space:nowrap;"
+            "overflow:hidden;text-overflow:ellipsis;max-width:100%;padding:0 4px}"
+            ".stu{font-size:.55rem;color:var(--dim);margin-top:2px;letter-spacing:.06em}"
+            ".psu-onbtn{flex-shrink:0;width:86px;border-radius:6px;background:var(--btn);"
+            "border:1px solid var(--bbd);color:var(--dim);font-size:.75rem;"
+            "font-weight:700;cursor:pointer;height:100%}"
+            ".psu-onbtn.cv{background:var(--on);border-color:var(--on-bd);color:var(--grn)}"
+            ".psu-onbtn.cc{background:var(--cc);border-color:var(--cc-bd);color:var(--amb)}"
+            ".psu-onbtn.err{background:var(--err);border-color:var(--err-bd);color:var(--red)}"));
+
+        // ── Dashboard: channel cards ──────────────────────────────────────────
+        c.print(F(
+            ".ch-row{display:flex;gap:.5rem;flex:1;min-height:0}"
+            ".ch-card{flex:1;background:var(--card);border:1px solid var(--bdr);"
+            "border-radius:8px;padding:.7rem;display:flex;flex-direction:column;gap:.38rem}"
+            ".ch-temp{font-size:2.6rem;font-weight:700;text-align:center;"
+            "color:var(--dim);line-height:1;flex-shrink:0}"
+            ".ch-temp.live{color:var(--txt)}"
+            // Temperature expands to fill available space and centers its text,
+            // which naturally bottom-aligns the status/bar/target group below it
+            ".ch-card .ch-temp{flex:1;display:flex;align-items:center;justify-content:center}"
+            ".sp-row{display:flex;align-items:center;justify-content:center;gap:.35rem}"));
+
+        // ── PSU page ──────────────────────────────────────────────────────────
+        c.print(F(
+            ".psu-tiles{display:grid;grid-template-columns:repeat(4,1fr);"
+            "gap:.5rem;flex-shrink:0}"
+            ".ptile{background:var(--tile);border:1px solid var(--bdr);border-radius:8px;"
+            "padding:.9rem .2rem;display:flex;flex-direction:column;"
+            "align-items:center;justify-content:center;min-height:110px}"
+            ".ptv{font-size:3.2rem;font-weight:700;line-height:1}"
+            ".ptu{font-size:.65rem;color:var(--dim);margin-top:6px;letter-spacing:.05em}"
+            ".presets{display:grid;grid-template-columns:repeat(9,1fr);"
+            "gap:.35rem;flex-shrink:0}"
+            ".pvbtn{background:var(--tile);border:1px solid var(--bdr);border-radius:5px;"
+            "display:flex;align-items:center;justify-content:center;min-height:48px;"
+            "font-size:.82rem;color:var(--dim);cursor:pointer;font-weight:700}"
+            ".pvbtn.act{background:var(--act);border-color:var(--blu);color:var(--blu)}"
+            ".pvbtn:active{border-color:var(--blu)}"
+            ".adj-row{display:flex;align-items:center;gap:.4rem;"
+            "flex-shrink:0;justify-content:center}"
+            ".abtn{width:70px;height:70px;border-radius:7px;background:var(--tile);"
+            "border:1px solid var(--bdr);cursor:pointer;display:flex;"
+            "flex-direction:column;align-items:center;justify-content:center;gap:2px}"
+            ".anum{font-size:.95rem;color:var(--txt);font-weight:700}"
+            ".asym{font-size:1.3rem;color:var(--dim);line-height:1}"
+            ".abtn:active{background:#333}"
+            ".svbox{flex:1;max-width:200px;background:var(--tile);"
+            "border:1px solid #2a4a7a;border-radius:8px;"
+            "display:flex;flex-direction:column;align-items:center;"
+            "justify-content:center;height:70px;cursor:pointer;padding:.35rem}"
+            ".svbox:active{background:#1a2030}"
+            ".svlbl{font-size:.58rem;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}"
+            ".svval{font-size:1.4rem;font-weight:700}"
+            ".psu-main-btn{width:100%;padding:1.1rem;border-radius:8px;"
+            "background:var(--btn);border:1px solid var(--bbd);color:var(--dim);"
+            "font-size:1.15rem;font-weight:700;cursor:pointer;letter-spacing:.07em}"
+            ".psu-main-btn.cv{background:var(--on);border-color:var(--on-bd);color:var(--grn)}"
+            ".psu-main-btn.cc{background:var(--cc);border-color:var(--cc-bd);color:var(--amb)}"
+            ".psu-main-btn.err{background:var(--err);border-color:var(--err-bd);color:var(--red)}"));
+
+        // ── Warmer page: constrained channel cards (not full-stretch) ────────
+        c.print(F(
+            ".wch-row{display:flex;gap:1rem;justify-content:center;"
+            "align-items:flex-start;padding:.5rem 0;flex-shrink:0}"
+            ".wch-card{width:300px;flex-shrink:0;background:var(--card);"
+            "border:1px solid var(--bdr);border-radius:8px;padding:.85rem;"
+            "display:flex;flex-direction:column;gap:.45rem}"
+            ".wch-temp{font-size:3.6rem;font-weight:700;text-align:center;"
+            "color:var(--dim);line-height:1;flex-shrink:0}"
+            ".wch-temp.live{color:var(--txt)}"
+            ".wsp-row{display:flex;align-items:center;justify-content:center;gap:.45rem}"
+            ".wpm{width:52px;height:52px;border-radius:8px;background:var(--tile);"
+            "border:1px solid var(--bdr);color:var(--txt);font-size:1.55rem;"
+            "cursor:pointer;display:flex;align-items:center;justify-content:center;"
+            "flex-shrink:0;line-height:1}"
+            ".wpm:active{background:#333}"
+            ".wspval{font-size:1.35rem;font-weight:700;min-width:4rem;text-align:center}"));
+
+        // ── Env page ──────────────────────────────────────────────────────────
+        c.print(F(
+            ".env-grid{display:grid;grid-template-columns:1fr 1fr;"
+            "gap:.5rem;flex:1;min-height:0}"
+            // Card: horizontal split — left=info, divider, right=gauge or tiers
+            ".env-card{background:var(--tile);border:1px solid var(--bdr);border-radius:8px;"
+            "padding:.75rem;display:flex;flex-direction:row;gap:.55rem;"
+            "overflow:hidden;align-items:stretch}"
+            ".env-left{display:flex;flex-direction:column;gap:.25rem;flex:1;min-width:0}"
+            ".env-vdiv{width:1px;background:#2a2a2a;align-self:stretch;flex-shrink:0}"
+            // All 4 cards share the same right-panel width → dividers align perfectly
+            ".env-right{flex-shrink:0;width:115px;display:flex;"
+            "align-items:center;justify-content:center}"
+            // Arc gauge SVG
+            ".egauge{width:94px;height:94px;display:block}"
+            // Tier bars: same 115px container, width:100% on .tier ensures
+            // flex:1 on .tbar-bg resolves correctly; scaleX drives the fill
+            ".env-tiers{flex-direction:column;gap:7px;justify-content:center}"
+            ".tier{display:flex;align-items:center;gap:.35rem;width:100%}"
+            ".tlbl{font-size:.58rem;color:var(--dim);width:34px;flex-shrink:0;"
+            "text-align:right;white-space:nowrap}"
+            ".tbar-bg{flex:1;height:7px;background:#2e2e2e;border-radius:3px;overflow:hidden}"
+            ".tbar{height:7px;border-radius:3px;width:100%;transform:scaleX(0);"
+            "transform-origin:left center;transition:transform .4s}"
+            // Left-panel text elements
+            ".elbl{font-size:.6rem;color:var(--dim);letter-spacing:.1em;font-weight:700;"
+            "text-transform:uppercase}"
+            // Value and unit are horizontally centred; margin-top:auto centres them
+            // vertically in the space between the label (top) and range/badge (bottom)
+            ".eval{font-size:2.2rem;font-weight:700;line-height:1.05;"
+            "text-align:center;margin-top:auto}"
+            ".eunit{font-size:.75rem;color:var(--dim);text-align:center}"
+            ".erange{font-size:.6rem;color:var(--dim);margin-top:auto;line-height:1.4;"
+            "text-align:center}"
+            ".iaq-badge{display:inline-flex;align-items:center;padding:.18rem .55rem;"
+            "border-radius:12px;font-size:.72rem;font-weight:700;border:1px solid;"
+            "width:fit-content;margin-top:auto;align-self:center}"));
+
+        // ── Status bar ────────────────────────────────────────────────────────
+        c.print(F(
+            ".sbar{background:#0a0a0a;border-top:1px solid var(--bdr);"
+            "padding:.28rem .7rem;display:flex;align-items:center;gap:.6rem;"
+            "flex-shrink:0;min-height:28px}"
+            ".di{display:flex;align-items:center;gap:3px}"
+            ".dot{width:6px;height:6px;border-radius:50%;background:var(--bdr)}"
+            ".dot.on{background:var(--grn)}.dot.off{background:var(--red)}"
+            ".dlbl{font-size:.58rem;color:var(--dim)}"
+            "#logstat{font-size:.65rem;color:var(--dim);margin-left:auto}"
+            ".nlink{color:var(--blu);font-size:.68rem;text-decoration:none;margin-left:.6rem}"
+            // Color utility classes matching CrowPanel palette
+            ".g{color:var(--grn)}.o{color:var(--acc)}.r{color:var(--red)}"
+            ".b{color:var(--blu)}.a{color:var(--amb)}.m{color:var(--mut)}"
+            // Responsive breakpoints
+            "@media(max-width:560px){"
+            ".psu-tiles{grid-template-columns:repeat(2,1fr)}"
+            ".presets{grid-template-columns:repeat(5,1fr)}"
+            ".ch-row{flex-direction:column}"
+            ".wch-row{flex-direction:column;align-items:center}"
+            ".wch-card{width:100%;max-width:360px}"
+            ".env-grid{grid-template-columns:1fr}"
+            // Header: shrink title and tabs on mobile; keep env summary visible but smaller
+            ".htitle{font-size:.72rem;letter-spacing:.02em}"
+            ".envhdr{font-size:.65rem;min-width:0}"
+            ".tabs{gap:.15rem}.tab{padding:.22rem .38rem;font-size:.63rem}"
+            // PSU strip: smaller tile text so VIN/SET values don't get clipped
+            ".stv{font-size:1.05rem;padding:0 2px}"
+            ".psu-strip{height:58px}"
+            ".psu-onbtn{width:64px;font-size:.68rem}}"
+            // ── Desktop: centered fixed-ratio card (1.5× CrowPanel 800×480) ──
+            // page-wrap centers the card; page-card is 1200×720 (same 5:3 ratio)
+            // On mobile these are transparent flex pass-throughs
+            ".page-wrap{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}"
+            ".page-card{flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden}"
+            "@media(min-width:1100px){"
+            ".page-wrap{flex-direction:row;align-items:center;justify-content:center;"
+            "padding:20px;overflow:auto;"
+            "background:radial-gradient(ellipse at 50% 50%,#111 0%,#040404 80%)}"
+            ".page-card{width:1200px;height:720px;flex:none;"
+            "border:1px solid var(--bdr);border-radius:10px;overflow:hidden;"
+            "box-shadow:0 0 80px rgba(255,128,64,.05),0 4px 40px rgba(0,0,0,.8);}"
+            // ── Desktop-only: PSU page tile readouts much bigger ──────────────
+            ".ptv{font-size:3.8rem}"
+            ".ptu{font-size:.72rem;margin-top:6px}"
+            // ── Desktop-only: dashboard channel card — enlarged for tall cards ─
+            // Temperature, status, bar, and target controls all scale up
+            ".ch-temp{font-size:4.8rem}"
+            ".chnm{font-size:.85rem}"
+            ".en-btn{padding:.3rem .7rem;font-size:.8rem}"
+            ".ch-stat{font-size:.92rem;padding:.22rem .52rem}"
+            ".ch-rate{font-size:.8rem}"
+            ".bar-wrap{height:14px}"
+            ".duty-pct{font-size:.82rem}"
+            ".tgt-lbl{font-size:.76rem;letter-spacing:.12em}"
+            ".pm{width:50px;height:50px;font-size:1.5rem}"
+            ".sp-val{font-size:1.35rem}}"
             "</style></head>"));
 
-        // ── BODY: header + nav ─────────────────────────────────────────────────
+        // ── BODY start + header ───────────────────────────────────────────────
         c.print(F("<body>"
-            "<header><h1>&#x1F525; PSU Warmer</h1>"
-            "<div class='hicons'>"
+            "<header>"
+            "<span class='htitle'>PSU WARMER</span>"
+            "<div class='tabs'>"
+            "<button class='tab act' id='tb-dash' onclick='pg(\"dash\")'>DASHBOARD</button>"
+            "<button class='tab' id='tb-psu'  onclick='pg(\"psu\")'>PSU</button>"
+            "<button class='tab' id='tb-warm' onclick='pg(\"warm\")'>WARMER</button>"
+            "<button class='tab' id='tb-env'  onclick='pg(\"env\")'>ENV</button>"
+            "</div>"
+            "<span class='envhdr' id='envhdr'>---</span>"
+            "</header>"));
+
+        // ── Dashboard page ────────────────────────────────────────────────────
+        c.print(F("<div class='page-wrap'><div class='page-card'>"
+            "<div id='pg-dash' class='page show'>"
+            "<div class='psu-strip'>"
+            "<div class='stile'><div class='stv g' id='ds-v'>---</div>"
+            "<div class='stu'>V OUT</div></div>"
+            "<div class='stile'><div class='stv o' id='ds-a'>---</div>"
+            "<div class='stu'>A OUT</div></div>"
+            "<div class='stile'><div class='stv r' id='ds-w'>---</div>"
+            "<div class='stu'>WATTS</div></div>"
+            "<div class='stile'><div class='stv m' id='ds-vin'>---</div>"
+            "<div class='stu'>V IN</div></div>"
+            "<div class='stile tap' onclick='pg(\"psu\")'>"
+            "<div class='stv' id='ds-sv'>---</div>"
+            "<div class='stu'>SET</div></div>"
+            "<button class='psu-onbtn' id='ds-on' onclick='psuTog()'>---</button>"
+            "</div>"
+            "<div class='ch-row'>"));
+
+        // Dashboard channel cards (two identical structures, different IDs)
+        for (int z = 1; z <= 2; z++) {
+            char buf[800];
+            snprintf(buf, sizeof(buf),
+                "<div class='ch-card'>"
+                "<div class='ch-hdr'>"
+                "<span class='chnm'>CH%d</span>"
+                "<button class='en-btn' id='de%d' onclick='cEnTog(%d)'>OFF</button>"
+                "</div>"
+                "<div class='ch-temp' id='dt%d'>---</div>"
+                "<div class='ch-stat-row'>"
+                "<span class='ch-stat' id='ds%d' style='color:var(--dim)'>DISABLED</span>"
+                "<span class='ch-rate' id='dr%d'></span>"
+                "</div>"
+                "<div class='bar-wrap'><div class='bar' id='db%d'></div></div>"
+                "<div class='duty-row'><span class='duty-pct' id='dp%d'>0%%</span></div>"
+                "<div class='divider'></div>"
+                "<div class='tgt-lbl'>Target</div>"
+                "<div class='sp-row'>"
+                "<button class='pm' onclick='cSp(%d,-1)'>&#8722;</button>"
+                "<span class='sp-val' id='dsp%d'>---</span>"
+                "<button class='pm' onclick='cSp(%d,1)'>+</button>"
+                "</div></div>",
+                z,z,z,z,z,z,z,z,z,z,z);
+            c.print(buf);
+        }
+        c.print(F("</div></div>")); // close ch-row, pg-dash
+
+        // ── PSU page ──────────────────────────────────────────────────────────
+        c.print(F("<div id='pg-psu' class='page'>"
+            "<div class='psu-tiles'>"
+            "<div class='ptile'><div class='ptv g' id='pv'>---</div>"
+            "<div class='ptu'>V OUT</div></div>"
+            "<div class='ptile'><div class='ptv o' id='pa'>---</div>"
+            "<div class='ptu'>A OUT</div></div>"
+            "<div class='ptile'><div class='ptv r' id='pw'>---</div>"
+            "<div class='ptu'>WATTS</div></div>"
+            "<div class='ptile'><div class='ptv m' id='pvin'>---</div>"
+            "<div class='ptu'>V IN</div></div>"
+            "</div>"
+            "<div class='presets'>"
+            "<div class='pvbtn' data-v='4'  onclick='psuset(4)'>4V</div>"
+            "<div class='pvbtn' data-v='5'  onclick='psuset(5)'>5V</div>"
+            "<div class='pvbtn' data-v='6'  onclick='psuset(6)'>6V</div>"
+            "<div class='pvbtn' data-v='7'  onclick='psuset(7)'>7V</div>"
+            "<div class='pvbtn' data-v='8'  onclick='psuset(8)'>8V</div>"
+            "<div class='pvbtn' data-v='9'  onclick='psuset(9)'>9V</div>"
+            "<div class='pvbtn' data-v='10' onclick='psuset(10)'>10V</div>"
+            "<div class='pvbtn' data-v='11' onclick='psuset(11)'>11V</div>"
+            "<div class='pvbtn' data-v='12' onclick='psuset(12)'>12V</div>"
+            "</div>"
+            "<div class='adj-row'>"
+            "<button class='abtn' onclick='psusp(-0.5)'>"
+            "<div class='anum'>0.5</div><div class='asym'>&#8722;</div></button>"
+            "<button class='abtn' onclick='psusp(-0.1)'>"
+            "<div class='anum'>0.1</div><div class='asym'>&#8722;</div></button>"
+            "<div class='svbox' onclick='psuKp()'>"
+            "<div class='svlbl'>Set Point</div>"
+            "<div class='svval' id='psv'>--.- V</div>"
+            "</div>"
+            "<button class='abtn' onclick='psusp(0.1)'>"
+            "<div class='anum'>0.1</div><div class='asym'>+</div></button>"
+            "<button class='abtn' onclick='psusp(0.5)'>"
+            "<div class='anum'>0.5</div><div class='asym'>+</div></button>"
+            "</div>"
+            "<button class='psu-main-btn' id='pon' onclick='psuTog()'>---</button>"
+            "</div>")); // pg-psu
+
+        // ── Warmer page ───────────────────────────────────────────────────────
+        c.print(F("<div id='pg-warm' class='page'><div class='wch-row'>"));
+        for (int z = 1; z <= 2; z++) {
+            char buf[820];
+            snprintf(buf, sizeof(buf),
+                "<div class='wch-card'>"
+                "<div class='ch-hdr'>"
+                "<span class='chnm'>CH%d</span>"
+                "<button class='en-btn' id='we%d' onclick='cEnTog(%d)'>OFF</button>"
+                "</div>"
+                "<div class='wch-temp' id='wt%d'>---</div>"
+                "<div class='ch-stat-row'>"
+                "<span class='ch-stat' id='wst%d' style='color:var(--dim)'>DISABLED</span>"
+                "<span class='ch-rate' id='wdr%d'></span>"
+                "</div>"
+                "<div class='bar-wrap'><div class='bar' id='wb%d'></div></div>"
+                "<div class='duty-row'><span class='duty-pct' id='wdp%d'>0%%</span></div>"
+                "<div class='divider'></div>"
+                "<div class='tgt-lbl'>Target</div>"
+                "<div class='wsp-row'>"
+                "<button class='wpm' onclick='cSp(%d,-1)'>&#8722;</button>"
+                "<span class='wspval' id='wsp%d'>---</span>"
+                "<button class='wpm' onclick='cSp(%d,1)'>+</button>"
+                "</div></div>",
+                z,z,z,z,z,z,z,z,z,z,z);
+            c.print(buf);
+        }
+        c.print(F("</div></div>")); // wch-row, pg-warm
+
+        // ── Env page ──────────────────────────────────────────────────────────
+        // Arc gauge maths: r=38, C=2π×38≈239, 270°arc=179px, gap=60px
+        // rotate(45 50 50) starts arc at SE, sweeps CW to NE — C-shape opening right
+        c.print(F("<div id='pg-env' class='page'><div class='env-grid'>"
+
+            // ── Temperature ──────────────────────────────────────────────────
+            "<div class='env-card'>"
+            "<div class='env-left'>"
+            "<div class='elbl'>Temperature</div>"
+            "<div class='eval g' id='et'>---</div>"
+            "<div class='eunit g'>&#xB0;F</div>"
+            "<div class='erange'>Range<br>40&#x2013;120&#xB0;F</div>"
+            "</div>"
+            "<div class='env-vdiv'></div>"
+            "<div class='env-right'>"
+            "<svg class='egauge' viewBox='0 0 100 100'>"
+            "<g transform='rotate(45 50 50)'>"
+            "<circle cx='50' cy='50' r='38' fill='none' stroke='#1a2a1a'"
+            " stroke-width='10' stroke-dasharray='179 239' stroke-linecap='round'/>"
+            "<circle cx='50' cy='50' r='38' fill='none' stroke='#33cc66'"
+            " stroke-width='10' stroke-dasharray='0 239' stroke-linecap='round' id='etg'/>"
+            "</g>"
+            "<text x='50' y='60' text-anchor='middle' fill='#505050'"
+            " font-size='11' font-family='sans-serif'>&#xB0;F</text>"
+            "</svg>"
+            "</div></div>"));
+
+        c.print(F(
+            // ── Humidity ─────────────────────────────────────────────────────
+            "<div class='env-card'>"
+            "<div class='env-left'>"
+            "<div class='elbl'>Humidity</div>"
+            "<div class='eval b' id='eh'>---</div>"
+            "<div class='eunit b'>%RH</div>"
+            "<div class='erange'>Comfort<br>30&#x2013;60%</div>"
+            "</div>"
+            "<div class='env-vdiv'></div>"
+            "<div class='env-right'>"
+            "<svg class='egauge' viewBox='0 0 100 100'>"
+            "<g transform='rotate(45 50 50)'>"
+            "<circle cx='50' cy='50' r='38' fill='none' stroke='#1a1e2a'"
+            " stroke-width='10' stroke-dasharray='179 239' stroke-linecap='round'/>"
+            "<circle cx='50' cy='50' r='38' fill='none' stroke='#55aaff'"
+            " stroke-width='10' stroke-dasharray='0 239' stroke-linecap='round' id='ehg'/>"
+            "</g>"
+            "<text x='50' y='60' text-anchor='middle' fill='#505050'"
+            " font-size='11' font-family='sans-serif'>%</text>"
+            "</svg>"
+            "</div></div>"
+
+            // ── Pressure ─────────────────────────────────────────────────────
+            "<div class='env-card'>"
+            "<div class='env-left'>"
+            "<div class='elbl'>Pressure</div>"
+            "<div class='eval m' id='ep'>---</div>"
+            "<div class='eunit' style='color:var(--mut)'>hPa</div>"
+            "<div class='erange'>Normal: 1013<br>950&#x2013;1050 hPa</div>"
+            "</div>"
+            "<div class='env-vdiv'></div>"
+            "<div class='env-right'>"
+            "<svg class='egauge' viewBox='0 0 100 100'>"
+            "<g transform='rotate(45 50 50)'>"
+            "<circle cx='50' cy='50' r='38' fill='none' stroke='#252525'"
+            " stroke-width='10' stroke-dasharray='179 239' stroke-linecap='round'/>"
+            "<circle cx='50' cy='50' r='38' fill='none' stroke='#d0d0d0'"
+            " stroke-width='10' stroke-dasharray='0 239' stroke-linecap='round' id='epg'/>"
+            "</g>"
+            "<text x='50' y='60' text-anchor='middle' fill='#505050'"
+            " font-size='9' font-family='sans-serif'>hPa</text>"
+            "</svg>"
+            "</div></div>"));
+
+        c.print(F(
+            // ── Air Quality (tier bars instead of arc, matching CrowPanel) ────
+            "<div class='env-card'>"
+            "<div class='env-left'>"
+            "<div class='elbl'>Air Quality</div>"
+            "<div class='eval a' id='eg'>---</div>"
+            "<div class='eunit' style='color:var(--amb)'>k&#x3A9; gas</div>"
+            "<span class='iaq-badge' id='eiaq' style='color:var(--amb)'>---</span>"
+            "</div>"
+            "<div class='env-vdiv'></div>"
+            "<div class='env-right env-tiers'>"
+            "<div class='tier'><span class='tlbl'>Excel</span>"
+            "<div class='tbar-bg'><div class='tbar' id='tier0'"
+            " style='background:#33cc66'></div></div></div>"
+            "<div class='tier'><span class='tlbl'>Good</span>"
+            "<div class='tbar-bg'><div class='tbar' id='tier1'"
+            " style='background:#55ccaa'></div></div></div>"
+            "<div class='tier'><span class='tlbl'>Fair</span>"
+            "<div class='tbar-bg'><div class='tbar' id='tier2'"
+            " style='background:#e3b341'></div></div></div>"
+            "<div class='tier'><span class='tlbl'>Poor</span>"
+            "<div class='tbar-bg'><div class='tbar' id='tier3'"
+            " style='background:#ff8040'></div></div></div>"
+            "<div class='tier'><span class='tlbl'>Bad</span>"
+            "<div class='tbar-bg'><div class='tbar' id='tier4'"
+            " style='background:#ff4444'></div></div></div>"
+            "</div></div>"
+
+            "</div></div>")); // env-grid, pg-env
+
+        c.print(F("</div></div>")); // page-card, page-wrap
+
+        // ── Status bar ────────────────────────────────────────────────────────
+        c.print(F(
+            "<div class='sbar'>"
             "<div class='di'><div class='dot' id='dLog'></div>"
-            "<span class='dlbl'>Log</span></div>"
+            "<span class='dlbl'>LOG</span></div>"
             "<div class='di'><div class='dot' id='dWiFi'></div>"
             "<span class='dlbl'>WiFi</span></div>"
             "<div class='di'><div class='dot' id='dPsu'></div>"
             "<span class='dlbl'>PSU</span></div>"
-            "<button class='usbtn' id='ubtn' onclick='toggleC()'>&#176;F</button>"
-            "</div></header>"
-            "<nav>"
-            "<a href='/dash' class='active'>Dashboard</a>"
-            "<a href='/fftable'>FF Table</a>"
-            "<a href='/diag'>Diagnostics</a>"
-            "<a href='/log'>&#x2B07; Log</a>"
-            "<span style='font-size:.72rem;color:var(--dim);margin-left:.25rem'"
-            " id='logstat'>---</span>"
-            "</nav><main>"));
+            "<span id='logstat'>---</span>"
+            "<a class='nlink' href='/fftable'>FF Table</a>"
+            "<a class='nlink' href='/diag'>Diag</a>"
+            "<a class='nlink' href='/log'>&#x2B07; Log</a>"
+            "</div>"));
 
-        // ── PSU panel (first) ──────────────────────────────────────────────────
-        c.print(F(
-            "<div class='psu-panel'>"
-            "<div class='psu-hdr'>"
-            "<span class='psu-title'>ZK-6522L Power Supply</span>"
-            "<button class='psu-tog-btn' id='psu-tog' onclick='psutog()'>---</button>"
-            "</div>"
-            "<div class='psu-metrics'>"
-            "<div class='psu-metric'><div class='psu-val c-v' id='pv'>---</div>"
-            "<div class='psu-unit'>V OUT</div></div>"
-            "<div class='psu-metric'><div class='psu-val c-a' id='pa'>---</div>"
-            "<div class='psu-unit'>A OUT</div></div>"
-            "<div class='psu-metric'><div class='psu-val c-w' id='pw'>---</div>"
-            "<div class='psu-unit'>W</div></div>"
-            "<div class='psu-metric'><div class='psu-val' id='pvin'>---</div>"
-            "<div class='psu-unit'>V IN</div></div>"
-            "</div>"
-            "<div class='div'></div>"
-            "<div class='psu-presets'>"
-            "<div class='pv-btn' data-v='4'  onclick='psuset(4)'>4V</div>"
-            "<div class='pv-btn' data-v='5'  onclick='psuset(5)'>5V</div>"
-            "<div class='pv-btn' data-v='6'  onclick='psuset(6)'>6V</div>"
-            "<div class='pv-btn' data-v='7'  onclick='psuset(7)'>7V</div>"
-            "<div class='pv-btn' data-v='8'  onclick='psuset(8)'>8V</div>"
-            "<div class='pv-btn' data-v='9'  onclick='psuset(9)'>9V</div>"
-            "<div class='pv-btn' data-v='10' onclick='psuset(10)'>10V</div>"
-            "<div class='pv-btn' data-v='11' onclick='psuset(11)'>11V</div>"
-            "<div class='pv-btn' data-v='12' onclick='psuset(12)'>12V</div>"
-            "</div>"
-            "<div class='tgtlbl'>Voltage Target</div>"
-            "<div class='psu-sv-row'>"
-            "<div class='pm-sm' onclick='psusp(-0.5)'>&#8722;.5</div>"
-            "<div class='pm-sm' onclick='psusp(-0.1)'>&#8722;.1</div>"
-            "<span class='psu-svval' id='psv'>--.- V</span>"
-            "<div class='pm-sm' onclick='psusp(0.1)'>+.1</div>"
-            "<div class='pm-sm' onclick='psusp(0.5)'>+.5</div>"
-            "</div>"
-            "</div>")); // end psu-panel
-
-        // ── Channel zones (second) ─────────────────────────────────────────────
-        c.print(F("<div class='ch-row'>"));
-        for (int z = 1; z <= 2; z++) {
-            char za[1100], zb[1200];
-            snprintf(za, sizeof(za),
-                "<div class='zone' id='zone%d'>"
-                "<div class='zhdr'><span class='znm'>CH%d</span>"
-                "<button class='onoff off' id='tog%d'"
-                " onclick='ctrl(%d,\"tog\")'>OFF</button></div>"
-                "<div class='temp' id='t%d'>---</div>"
-                "<div class='strow'>"
-                "<span class='st IDLE' id='st%d'>---</span>"
-                "<span class='dtdt' id='dt%d'></span></div>",
-                z,z,z,z,z,z,z);
-            snprintf(zb, sizeof(zb),
-                "<div class='brow'>"
-                "<div class='barwrap' style='flex:1'>"
-                "<div class='barfill' id='bar%d'></div></div>"
-                "<span class='bpct' id='bp%d'>0%%</span></div>"
-                "<div class='div'></div>"
-                "<div class='tgt'><div class='tgtlbl'>Battery Target</div>"
-                "<div class='tgtrow'>"
-                "<div class='pm' onclick='ctrl(%d,\"sp_dn\")'>&#8722;</div>"
-                "<span class='spval' id='sp%d'>---</span>"
-                "<div class='pm' onclick='ctrl(%d,\"sp_up\")'>&#43;</div>"
-                "</div></div>"
-                "<div class='ffrow'><span class='fflbl'>FF learned</span>"
-                "<span class='fflbl' id='ff%d'>0%%</span></div>"
-                "</div>",
-                z,z,z,z,z,z);
-            c.print(za); c.print(zb);
-        }
-        c.print(F("</div>")); // end ch-row
-
-        // ── JavaScript ────────────────────────────────────────────────────────
-        c.print(F("</main><script>"
-            "let C=false,last=null;"
-            "function tf(f){if(f<=-998)return'---';"
-            "return C?((f-32)*5/9).toFixed(1)+'\\u00b0C':f.toFixed(1)+'\\u00b0F';}"
-            "function tfSp(f){if(f<=-998)return'---';"
+        // ── JavaScript: utilities ─────────────────────────────────────────────
+        c.print(F("<script>"
+            "'use strict';"
+            "let D=null,C=false,CP='dash';"
+            // Page switch
+            "function pg(p){"
+            "CP=p;"
+            "['dash','psu','warm','env'].forEach(n=>{"
+            "document.getElementById('pg-'+n).classList.toggle('show',n===p);"
+            "const t=document.getElementById('tb-'+n);"
+            "if(t)t.classList.toggle('act',n===p);});"
+            "}"
+            // Temperature display
+            "function tf(f,dp){"
+            "dp=dp||1;"
+            "if(f<=-998)return'---';"
+            "return C?((f-32)*5/9).toFixed(dp)+'\\u00b0C':f.toFixed(dp)+'\\u00b0F';}"
+            "function tfsp(f){"
+            "if(f<=-998)return'---';"
             "return C?Math.round((f-32)*5/9)+'\\u00b0C':Math.round(f)+'\\u00b0F';}"
-            "function toggleC(){C=!C;"
-            "document.getElementById('ubtn').textContent=C?'\\u00b0C':'\\u00b0F';"
-            "paint(last);}"
+            // Status text color (matches CrowPanel statusColor())
+            "function sc(s){"
+            "return{'HEATING':'#ff8040','HOLDING':'#33cc66','REDUCING':'#55aaff',"
+            "'CUTOFF':'#ff4444','SENS ERR':'#ff4444'}[s]||'#909090';}"
+            // Duty bar gradient color (green→orange→red)
+            "function bc(pct){"
+            "const h=Math.max(0,120-pct*1.2);"
+            "return'hsl('+h+',75%,40%)';}"
+            // Generic element text setter (no-op if element missing)
+            "function st(id,txt){"
+            "const e=document.getElementById(id);if(e)e.textContent=txt;}"));
 
-            // Channel paint
-            "function paintChannels(d){"
-            "[1,2].forEach(n=>{"
-            "const ch=d['ch'+n],en=ch.enabled,ok=ch.temp>-998;"
-            "const tEl=document.getElementById('t'+n);"
+        // ── JavaScript: paint channel card ────────────────────────────────────
+        c.print(F(
+            // paintCh(ch, n, pfx)
+            // ch = API channel object, n = 1|2, pfx = 'd' (dashboard) or 'w' (warmer)
+            "function paintCh(ch,n,pfx){"
+            "if(!ch)return;"
+            "const en=ch.enabled,ok=ch.temp>-998;"
+            // Temperature
+            "const tEl=document.getElementById(pfx+'t'+n);"
+            "if(tEl){"
             "tEl.textContent=tf(ch.temp);"
-            "tEl.className='temp'+(en&&ok?' live':'');"
-            "const stk=ch.status.replace(/ /g,'');"
-            "const sEl=document.getElementById('st'+n);"
-            "sEl.textContent=ch.status;sEl.className='st '+stk;"
-            "document.getElementById('sp'+n).textContent=tfSp(ch.setpt);"
-            "document.getElementById('bp'+n).textContent=ch.duty.toFixed(0)+'%';"
-            "const bar=document.getElementById('bar'+n);"
+            "tEl.className=(pfx==='d'?'ch-temp':'wch-temp')+(en&&ok?' live':'');}"
+            // Status
+            "const se=document.getElementById(pfx==='d'?'ds'+n:'wst'+n);"
+            "if(se){se.textContent=ch.status;se.style.color=sc(ch.status);}"
+            // dT/dt rate
+            "const re=document.getElementById(pfx==='d'?'dr'+n:'wdr'+n);"
+            "if(re){"
+            "const r=ch.dtdt*60;"
+            "re.textContent=Math.abs(r)>0.1?(r>0?'+':'')+r.toFixed(1)+'\\u00b0/m':\"\";}"
+            // Duty bar
+            "const bar=document.getElementById(pfx+'b'+n);"
+            "if(bar){"
             "bar.style.width=Math.min(ch.duty,100)+'%';"
-            "bar.style.backgroundColor='hsl('+(120-ch.duty*1.2)+',85%,45%)';"
-            "document.getElementById('ff'+n).textContent=ch.ff.toFixed(1)+'%';"
-            "const tog=document.getElementById('tog'+n);"
-            "tog.textContent=en?'ON':'OFF';"
-            "tog.className='onoff '+(en?'on':'off');"
-            "const rpm=ch.dtdt*60;"
-            "document.getElementById('dt'+n).textContent="
-            "Math.abs(rpm)>0.1?(rpm>0?'+':'')+rpm.toFixed(1)+'\\u00b0/m':'';});}"
+            "bar.style.backgroundColor=bc(ch.duty);}"
+            // Duty %
+            "const dp=document.getElementById(pfx==='d'?'dp'+n:'wdp'+n);"
+            "if(dp)dp.textContent=ch.duty.toFixed(0)+'%';"
+            // Setpoint
+            "const sp=document.getElementById(pfx==='d'?'dsp'+n:'wsp'+n);"
+            "if(sp)sp.textContent=tfsp(ch.setpt);"
+            // Enable button
+            "const eb=document.getElementById(pfx==='d'?'de'+n:'we'+n);"
+            "if(eb){eb.textContent=en?'ON':'OFF';eb.className='en-btn'+(en?' on':'');}"
+            "}"));
 
-            // PSU paint
+        // ── JavaScript: paint PSU (both strip and PSU page) ───────────────────
+        c.print(F(
             "function paintPsu(p){"
-            "const tog=document.getElementById('psu-tog');"
+            "const dsOn=document.getElementById('ds-on');"
+            "const pOn=document.getElementById('pon');"
+            "const dPsu=document.getElementById('dPsu');"
             "if(!p||!p.ok){"
-            "tog.textContent='NO COMM';tog.className='psu-tog-btn fault';"
-            "['pv','pa','pw','pvin','psv'].forEach(id=>{document.getElementById(id).textContent='---';});"
-            "document.querySelectorAll('.pv-btn').forEach(b=>b.classList.remove('active'));"
-            "document.getElementById('dPsu').className='dot off';return;}"
-            "document.getElementById('pv').textContent=p.v.toFixed(1);"
-            "document.getElementById('pa').textContent=p.a.toFixed(1);"
-            "document.getElementById('pw').textContent=p.w.toFixed(1);"
-            "document.getElementById('pvin').textContent=p.vin.toFixed(1);"
-            "document.getElementById('psv').textContent=p.sv.toFixed(2)+' V';"
-            "if(p.prot){tog.textContent=p.status;tog.className='psu-tog-btn fault';}"
-            "else if(!p.on){tog.textContent='OFF';tog.className='psu-tog-btn';}"
-            "else if(p.cc){tog.textContent='ON \\u00b7 CC';tog.className='psu-tog-btn on-cc';}"
-            "else{tog.textContent='ON \\u00b7 CV';tog.className='psu-tog-btn on-cv';}"
-            "document.querySelectorAll('.pv-btn').forEach(b=>{"
-            "b.classList.toggle('active',parseFloat(b.dataset.v)===p.sv);});"
-            "document.getElementById('dPsu').className=p.ok?'dot on':'dot off';}"
+            // No comm: blank all readouts, show fault state
+            "['ds-v','ds-a','ds-w','ds-vin','ds-sv',"
+            "'pv','pa','pw','pvin','psv'].forEach("
+            "function(id){st(id,'---');});"
+            "if(dsOn){dsOn.textContent='NO COMM';dsOn.className='psu-onbtn err';}"
+            "if(pOn){pOn.textContent='NO COMM';pOn.className='psu-main-btn err';}"
+            "if(dPsu)dPsu.className='dot off';"
+            "document.querySelectorAll('.pvbtn').forEach(function(b){"
+            "b.classList.remove('act');});"
+            "return;}"
+            // Good data
+            "st('ds-v',p.v.toFixed(1));st('ds-a',p.a.toFixed(1));"
+            "st('ds-w',p.w.toFixed(1));st('ds-vin',p.vin.toFixed(1));"
+            "st('ds-sv',p.sv.toFixed(2));"
+            "st('pv',p.v.toFixed(1));st('pa',p.a.toFixed(1));"
+            "st('pw',p.w.toFixed(1));st('pvin',p.vin.toFixed(1));"
+            "st('psv',p.sv.toFixed(2)+' V');"
+            // Button classes + labels
+            "const cls=p.prot?'err':p.on?(p.cc?'cc':'cv'):'';"
+            "const lbl=p.prot?p.status:p.on?(p.cc?'ON \\u00b7 CC':'ON \\u00b7 CV'):'OFF';"
+            "if(dsOn){dsOn.textContent=lbl;dsOn.className='psu-onbtn '+cls;}"
+            "if(pOn){pOn.textContent=lbl;pOn.className='psu-main-btn '+cls;}"
+            "if(dPsu)dPsu.className=p.ok?'dot on':'dot off';"
+            // Preset highlight
+            "document.querySelectorAll('.pvbtn').forEach(function(b){"
+            "b.classList.toggle('act',parseFloat(b.dataset.v)===p.sv);});"
+            "}"));
 
-            // Status indicators
-            "function paintMeta(d){"
-            "document.getElementById('dWiFi').className='dot on';"
-            "const logEl=document.getElementById('dLog');"
-            "if(logEl)logEl.className=d.usb?'dot on':'dot off';"
-            "const ls=document.getElementById('logstat');"
-            "if(ls)ls.textContent=d.usb?d.logrows+' rows':'logger off';}"
+        // ── JavaScript: paint Env page ────────────────────────────────────────
+        c.print(F(
+            // Set a C-shaped SVG arc to pct (0.0–1.0). 179 = full 270° at r=38.
+            "function setArc(id,pct){"
+            "const e=document.getElementById(id);"
+            "if(e)e.setAttribute('stroke-dasharray',"
+            "(Math.min(Math.max(pct,0),1)*179).toFixed(1)+' 239');}"
+            "function paintEnv(e){"
+            "if(!e||!e.valid)return;"
+            // IAQ classification matching CrowPanel iaqLabel() / iaqColor()
+            "const iaq=e.g>=300?'Excellent':e.g>=150?'Good':"
+            "e.g>=50?'Fair':e.g>=25?'Poor':'Bad';"
+            "const iqc=e.g>=300?'#33cc66':e.g>=150?'#55ccaa':"
+            "e.g>=50?'#e3b341':e.g>=25?'#ff8040':'#ff4444';"
+            // Text values
+            "st('et',e.t.toFixed(1));st('eh',e.h.toFixed(1));"
+            "st('ep',e.p.toFixed(1));st('eg',e.g.toFixed(1));"
+            "const egEl=document.getElementById('eg');"
+            "if(egEl)egEl.style.color=iqc;"
+            "const ib=document.getElementById('eiaq');"
+            "if(ib){ib.textContent=iaq;ib.style.color=iqc;}"
+            // Header summary
+            "document.getElementById('envhdr').textContent="
+            "e.t.toFixed(1)+'\\u00b0  '+e.h.toFixed(1)+'%';"
+            // Arc gauges (270° sweep, 179px = 100%)
+            "setArc('etg',Math.min(Math.max((e.t-40)/80,0),1));"
+            "setArc('ehg',Math.min(e.h/100,1));"
+            "setArc('epg',Math.min(Math.max((e.p-950)/100,0),1));"
+            // Tier bars — each fills proportionally within its own range
+            // matching CrowPanel: tierMin[]={300,150,50,25,0}, tierMax[]={500,300,150,50,25}
+            "const tm=[300,150,50,25,0],tx=[500,300,150,50,25];"
+            "for(let i=0;i<5;i++){"
+            "const pct=Math.min(Math.max((e.g-tm[i])/(tx[i]-tm[i]),0),1);"
+            "const bar=document.getElementById('tier'+i);"
+            "if(bar)bar.style.transform='scaleX('+pct.toFixed(3)+')';}"
+            "}"));
 
-            // Main paint
-            "function paint(d){if(!d)return;last=d;"
-            "paintChannels(d);paintPsu(d.psu);paintMeta(d);}"
+        // ── JavaScript: master paint + meta indicators ────────────────────────
+        c.print(F(
+            "function paint(d){"
+            "D=d;"
+            "[1,2].forEach(function(n){"
+            "paintCh(d['ch'+n],n,'d');"
+            "paintCh(d['ch'+n],n,'w');"
+            "});"
+            "paintPsu(d.psu);"
+            "paintEnv(d.env);"
+            "const dw=document.getElementById('dWiFi');"
+            "if(dw)dw.className='dot on';"
+            "const dl=document.getElementById('dLog');"
+            "if(dl)dl.className=d.usb?'dot on':'dot off';"
+            "st('logstat',d.usb?d.logrows+' rows':'---');"
+            "}"));
 
-            // Channel control
-            "async function ctrl(ch,cmd){"
-            "try{const r=await fetch('/control?ch='+ch+'&cmd='+(cmd==='tog'?"
-            "(last&&last['ch'+ch].enabled?'disable':'enable'):cmd));"
-            "if(r.ok){const j=await r.json();if(j.ok)poll();}}catch(e){}}"
-
+        // ── JavaScript: control functions ─────────────────────────────────────
+        c.print(F(
+            // Channel enable toggle
+            "async function cEnTog(n){"
+            "const en=D&&D['ch'+n]&&D['ch'+n].enabled;"
+            "try{await fetch('/control?ch='+n+'&cmd='+(en?'disable':'enable'));"
+            "poll();}catch(e){}}"
+            // Channel setpoint ±1°F
+            "async function cSp(n,d){"
+            "try{await fetch('/control?ch='+n+'&cmd='+(d>0?'sp_up':'sp_dn'));"
+            "poll();}catch(e){}}"
             // PSU output toggle
-            "async function psutog(){"
-            "const on=last&&last.psu&&last.psu.on;"
+            "async function psuTog(){"
+            "const on=D&&D.psu&&D.psu.on;"
             "try{await fetch('/control?cmd='+(on?'psu_off':'psu_on'));"
             "poll();}catch(e){}}"
-
-            // PSU setpoint bump
+            // PSU setpoint bump (±V)
             "async function psusp(d){"
-            "const sv=(last&&last.psu)?+(last.psu.sv+d).toFixed(2):12;"
+            "const sv=D&&D.psu?+(D.psu.sv+d).toFixed(2):12;"
             "try{await fetch('/control?cmd=psu_sv&v='+sv);poll();}catch(e){}}"
-
-            // PSU quick preset
+            // PSU voltage preset
             "async function psuset(v){"
             "try{await fetch('/control?cmd=psu_sv&v='+v);poll();}catch(e){}}"
+            // PSU voltage keypad (browser prompt — simple, no flash overhead)
+            "function psuKp(){"
+            "const cur=D&&D.psu?D.psu.sv.toFixed(2):'';"
+            "const s=prompt('Set voltage (4.00\\u201365.00 V):',cur);"
+            "if(s!==null){const v=parseFloat(s);"
+            "if(v>=4.0&&v<=65.0)psuset(v);}}"
+            ));
 
-            // Poll loop
+        // ── JavaScript: API poll loop ─────────────────────────────────────────
+        c.print(F(
             "async function poll(){"
-            "try{const r=await fetch('/api',{cache:'no-store'});"
-            "if(r.ok)paint(await r.json());}catch(e){"
-            "document.getElementById('dWiFi').className='dot off';}}"
+            "try{"
+            "const r=await fetch('/api',{cache:'no-store'});"
+            "if(r.ok)paint(await r.json());"
+            "}catch(ex){"
+            "const dw=document.getElementById('dWiFi');"
+            "if(dw)dw.className='dot off';"
+            "}}"
             "poll();setInterval(poll,2000);"
             "</script></body></html>"));
     }
