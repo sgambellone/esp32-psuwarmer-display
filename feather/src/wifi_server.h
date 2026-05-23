@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include "config.h"
 #include "logger.h"
+#include <time.h>
+#include <SD.h>
 #include "channel.h"
 #include "psu.h"
 
@@ -57,8 +59,13 @@ public:
                       WiFi.softAPIP().toString().c_str());
     }
 
-    void setLogger(WarmLogger* l) { _logger = l; }
-    void setPsu(ZkPsu* p)         { _psu = p; }
+    void setLogger(WarmLogger* l)           { _logger = l; }
+    void setPsu(ZkPsu* p)                   { _psu = p; }
+    void setCrowPanelSerial(HardwareSerial* s){ _crowSerial = s; }
+    void setCurrentEpoch(uint32_t e, unsigned long ms){ _currentEpoch=e; _epochSetMs=ms; }
+    // Epoch set via /settime web endpoint — poll from main loop to sync _rtcEpoch
+    uint32_t      rtcSetEpoch() const { return _rtcEpoch; }
+    unsigned long rtcSetMs()    const { return _rtcEpochMs; }
     bool ready() const            { return _ready; }
 
     // Called from main.cpp after each successful BME680 endReading().
@@ -111,7 +118,10 @@ public:
         else if (strncmp(path, "/diag",    5) == 0) _serveDiag(client);
         else if (strncmp(path, "/dash",    5) == 0) _serveDash(client);
         else if (strncmp(path, "/control", 8) == 0) _serveControl(client, req);
-        else if (strncmp(path, "/log",     4) == 0) _serveLog(client);
+        else if (strncmp(path, "/clearlog",9) == 0) _serveClearLog(client);
+        else if (strncmp(path, "/logview", 8) == 0) _serveLogView(client, path);
+        else if (strncmp(path, "/log",     4) == 0) _serveLog(client, path);
+        else if (strncmp(path, "/settime", 8) == 0) _serveSetTime(client, path);
         else if (strncmp(path, "/status",  7) == 0) _serveStatus(client);
         else                                         _serveRedirect(client, "/dash");
 
@@ -127,15 +137,20 @@ public:
     }
 
 private:
-    WiFiServer      _server;
-    bool            _ready;
-    WarmLogger*     _logger;
-    ZkPsu*          _psu;
-    HeatingChannel* _ch1;
-    HeatingChannel* _ch2;
-    EnvData         _env;
-    unsigned long   _reqCount;
-    unsigned long   _lastHeartbeatMs;
+    WiFiServer       _server;
+    bool             _ready;
+    WarmLogger*      _logger;
+    ZkPsu*           _psu;
+    HeatingChannel*  _ch1;
+    HeatingChannel*  _ch2;
+    EnvData          _env;
+    unsigned long    _reqCount;
+    unsigned long    _lastHeartbeatMs;
+    HardwareSerial*  _crowSerial  = nullptr;   // Serial2 → CrowPanel
+    uint32_t         _rtcEpoch    = 0;         // last epoch set via /settime
+    unsigned long    _rtcEpochMs  = 0;         // millis() when _rtcEpoch was set
+    uint32_t         _currentEpoch = 0;        // current UTC epoch for display
+    unsigned long    _epochSetMs   = 0;        // millis() when _currentEpoch was set
 
     // ── Helpers ───────────────────────────────────────────────────────────────
     void _sendHeaders(WiFiClient& c, int code, const char* mime, long len = -1) {
@@ -202,10 +217,21 @@ private:
         }
 
         bool logOn = _logger && _logger->enabled();
-        c.printf(",\"usb\":%s,\"logrows\":%d,\"logkb\":%d}",
+        // Compute current epoch from stored reference + elapsed time
+        uint32_t nowEpoch = (_currentEpoch > 0)
+            ? _currentEpoch + (uint32_t)((millis() - _epochSetMs) / 1000)
+            : 0;
+        char isoNow[24] = "";
+        if (nowEpoch > 0) {
+            time_t t = (time_t)nowEpoch;
+            struct tm* tm = gmtime(&t);
+            if (tm) strftime(isoNow, sizeof(isoNow), "%Y-%m-%d %H:%M:%S", tm);
+        }
+        c.printf(",\"usb\":%s,\"logrows\":%d,\"logkb\":%d,\"ts\":\"%s\"}",
                  logOn ? "true" : "false",
                  logOn ? _logger->rowsTotal() : 0,
-                 logOn ? _logger->bufferUsed()/1024 : 0);
+                 logOn ? _logger->bufferUsed()/1024 : 0,
+                 isoNow);
     }
 
     // ── /control — command endpoint ───────────────────────────────────────────
@@ -255,14 +281,188 @@ private:
                      _psu->statusStr(), _psu->measV, _psu->measA, _psu->setV);
     }
 
-    // ── /log — CSV download ───────────────────────────────────────────────────
-    void _serveLog(WiFiClient& c) {
+    // ── /log — CSV download; supports ?file=LOG_YYYYMMDD_HHMMSS.CSV ──────────
+    void _serveLog(WiFiClient& c, const char* path) {
         if (!_logger || !_logger->enabled()) {
-            _sendHeaders(c, 404, "text/plain");
-            c.print("Logger not active");
+            _sendHeaders(c, 404, "text/plain"); c.print("Logger not active"); return;
+        }
+        const char* fp = strstr(path, "?file=");
+        char fname[32] = {};
+        if (fp) strncpy(fname, fp + 6, sizeof(fname) - 1);
+        // Strip HTTP version suffix if present (e.g. " HTTP/1.1")
+        char* sp = strchr(fname, ' '); if (sp) *sp = '\0';
+        _logger->serveFile(c, fname[0] ? fname : nullptr);
+    }
+
+    // ── /clearlog — delete all LOG_*.CSV files via resetLogs() ──────────────
+    void _serveClearLog(WiFiClient& c) {
+        if (!_logger) {
+            _sendHeaders(c, 400, "application/json");
+            c.print(F("{\"ok\":false,\"err\":\"no logger\"}"));
             return;
         }
-        _logger->serveFile(c);
+        int deleted = _logger->resetLogs();  // directory scan delete + reset state
+        _sendHeaders(c, 200, "application/json");
+        c.printf("{\"ok\":true,\"deleted\":%d}", deleted);
+    }
+
+    // ── /logview — file browser + inline viewer ─────────────────────────────────
+    // GET /logview          → shows file list + last 300 rows of current file
+    // GET /logview?file=X   → shows file list + last 300 rows of file X
+    void _serveLogView(WiFiClient& c, const char* path) {
+        if (!_logger || !_logger->enabled()) {
+            _sendHeaders(c, 404, "text/plain"); c.print("Logger not active"); return;
+        }
+        _logger->flush();
+
+        // Parse optional ?file= parameter
+        const char* fp = strstr(path, "?file=");
+        char selectedFile[32] = {};
+        if (fp) {
+            strncpy(selectedFile, fp + 6, sizeof(selectedFile) - 1);
+            char* sp = strchr(selectedFile, ' '); if (sp) *sp = '\0';
+        }
+        // Default to current log file
+        if (!selectedFile[0] && _logger->filepath() && _logger->filepath()[0])
+            strncpy(selectedFile, _logger->filepath() + 1, sizeof(selectedFile) - 1);
+
+        // Collect file list (max 50)
+        static char files[50][32];
+        int nFiles = _logger->listFiles(files, 50);
+
+        _sendHeaders(c, 200, "text/html");
+        c.print(F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+                  "<title>PSU Warmer Logs</title>"
+                  "<style>"
+                  "body{background:#111;color:#eee;font:13px/1.4 monospace;margin:0;display:flex;flex-direction:column;height:100vh}"
+                  "h2{color:#f90;margin:8px 12px 4px}"
+                  ".top{padding:6px 12px;background:#1a1a1a;border-bottom:1px solid #333;display:flex;gap:12px;align-items:center;flex-wrap:wrap}"
+                  ".top a{color:#f90;text-decoration:none;font-size:.85rem}"
+                  ".top a:hover{text-decoration:underline}"
+                  ".layout{display:flex;flex:1;overflow:hidden}"
+                  ".sidebar{width:240px;min-width:180px;overflow-y:auto;background:#161616;border-right:1px solid #333;padding:8px 0}"
+                  ".sidebar h3{color:#888;font-size:.75rem;text-transform:uppercase;padding:4px 10px;margin:0}"
+                  ".fitem{display:block;padding:5px 10px;color:#ccc;text-decoration:none;font-size:.8rem;border-left:3px solid transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+                  ".fitem:hover{background:#222;color:#f90}"
+                  ".fitem.active{border-left-color:#f90;color:#f90;background:#1f1800}"
+                  ".content{flex:1;overflow-y:auto;padding:0}"
+                  "table{border-collapse:collapse;width:100%;font-size:.75rem}"
+                  "th{background:#222;color:#f90;padding:4px 6px;position:sticky;top:0;white-space:nowrap}"
+                  "td{padding:2px 6px;border-bottom:1px solid #1a1a1a;white-space:nowrap}"
+                  "tr:hover td{background:#1a1a1a}"
+                  ".empty{padding:20px;color:#666;text-align:center}"
+                  "</style></head><body>"));
+
+        c.print(F("<div class='top'>"
+                  "<h2>&#128202; Log Files</h2>"
+                  "<a href='/dash'>&#x2190; Dashboard</a>"));
+        if (selectedFile[0]) {
+            c.printf("<a href='/log?file=%s'>&#x2B07; Download %s</a>", selectedFile, selectedFile);
+        }
+        c.print(F("</div><div class='layout'><div class='sidebar'>"
+                  "<h3>Log Files</h3>"));
+
+        // Render file list (newest first — reverse the sorted array)
+        if (nFiles == 0) {
+            c.print(F("<div class='empty'>No log files found</div>"));
+        } else {
+            for (int i = nFiles - 1; i >= 0; i--) {
+                bool active = (strcmp(files[i], selectedFile) == 0);
+                c.printf("<a class='fitem%s' href='/logview?file=%s'>%s</a>",
+                         active ? " active" : "", files[i], files[i]);
+            }
+        }
+        c.print(F("</div><div class='content'>"));
+
+        // Stream last 300 rows of selected file as HTML table
+        if (selectedFile[0]) {
+            char fpath[36]; snprintf(fpath, sizeof(fpath), "/%s", selectedFile);
+            File f = SD.open(fpath, FILE_READ);
+            if (!f) {
+                c.print(F("<div class='empty'>File not found</div>"));
+            } else {
+                static const int MAX_ROWS = 300;
+                static const int MAX_LINE = 280;
+                static char lines[MAX_ROWS][MAX_LINE];
+                int count = 0, total = 0;
+                char lineBuf[MAX_LINE]; int lPos = 0;
+                while (f.available()) {
+                    char ch = f.read();
+                    if (ch == '\n' || lPos == MAX_LINE - 1) {
+                        lineBuf[lPos] = '\0';
+                        if (lPos > 0) {
+                            strncpy(lines[count % MAX_ROWS], lineBuf, MAX_LINE - 1);
+                            count++; total++;
+                        }
+                        lPos = 0;
+                    } else { lineBuf[lPos++] = ch; }
+                }
+                f.close();
+
+                c.printf("<div style='padding:4px 8px;font-size:.75rem;color:#888'>"
+                         "Showing last %d of %d rows</div>",
+                         min(count - 1, MAX_ROWS - 1), max(0, total - 1));
+
+                // Header row
+                int start = (count > MAX_ROWS) ? count % MAX_ROWS : 0;
+                c.print(F("<table><thead><tr>"));
+                char hdr[MAX_LINE]; strncpy(hdr, lines[start], MAX_LINE - 1);
+                char* tok = strtok(hdr, ",");
+                while (tok) { c.printf("<th>%s</th>", tok); tok = strtok(nullptr, ","); }
+                c.print(F("</tr></thead><tbody>"));
+
+                start = (start + 1) % MAX_ROWS;
+                int shown = min(count - 1, MAX_ROWS - 1);
+                for (int i = 0; i < shown; i++) {
+                    int idx = (start + i) % MAX_ROWS;
+                    c.print(F("<tr>"));
+                    char row[MAX_LINE]; strncpy(row, lines[idx], MAX_LINE - 1);
+                    tok = strtok(row, ",");
+                    while (tok) { c.printf("<td>%s</td>", tok); tok = strtok(nullptr, ","); }
+                    c.print(F("</tr>"));
+                }
+                c.print(F("</tbody></table>"));
+            }
+        } else {
+            c.print(F("<div class='empty'>Select a log file from the list</div>"));
+        }
+        c.print(F("</div></div></body></html>"));
+    }
+
+        // ── /settime?t=<unix_epoch> — set CrowPanel RTC ──────────────────────────
+    void _serveSetTime(WiFiClient& c, const char* path) {
+        // Extract t= param
+        const char* tParam = strstr(path, "?t=");
+        if (!tParam) {
+            _sendHeaders(c, 400, "application/json");
+            c.print(F("{\"ok\":false,\"err\":\"missing ?t=epoch\"}"));
+            return;
+        }
+        uint32_t epoch = (uint32_t)atol(tParam + 3);
+        if (epoch < 1700000000UL) {
+            _sendHeaders(c, 400, "application/json");
+            c.print(F("{\"ok\":false,\"err\":\"epoch out of range\"}"));
+            return;
+        }
+        // Parse optional timezone offset (minutes east of UTC, e.g. -240 = EDT)
+        int32_t tzMinutes = 0;
+        const char* tzParam = strstr(path, "&tz=");
+        if (tzParam) tzMinutes = (int32_t)atol(tzParam + 4);
+        // Forward UTC epoch + tz offset to CrowPanel
+        if (_crowSerial) {
+            char cmd[64];
+            snprintf(cmd, sizeof(cmd),
+                     "{\"cmd\":\"set_rtc\",\"v\":%lu,\"tz\":%ld}\n",
+                     (unsigned long)epoch, (long)tzMinutes);
+            _crowSerial->print(cmd);
+            Serial.printf("[wifi] set_rtc utc=%lu tz=%ldmin → CrowPanel\n",
+                          (unsigned long)epoch, (long)tzMinutes);
+        }
+        _rtcEpoch   = epoch;
+        _rtcEpochMs = millis();
+        _sendHeaders(c, 200, "application/json");
+        c.printf("{\"ok\":true,\"epoch\":%lu}", (unsigned long)epoch);
     }
 
     // ── /fftable — feedforward table viewer ───────────────────────────────────
@@ -814,13 +1014,31 @@ private:
             "<span id='logstat'>---</span>"
             "<a class='nlink' href='/fftable'>FF Table</a>"
             "<a class='nlink' href='/diag'>Diag</a>"
-            "<a class='nlink' href='/log'>&#x2B07; Log</a>"
+            "<a class='nlink' href='/logview'>&#x1F4CB; View Log</a>"
+            "<a class='nlink' href='/log'>&#x2B07; Download Log</a>"
+            "<a class='nlink' href='#' onclick='setTime();return false;'>&#x23F0; Set Time</a>"
+            "<a class='nlink' href='#' onclick='clearLogs();return false;' style='color:#e55;'>&#x1F5D1; Clear Logs</a>"
             "</div>"));
 
         // ── JavaScript: utilities ─────────────────────────────────────────────
         c.print(F("<script>"
             "'use strict';"
             "let D=null,C=false,CP='dash';"
+            "function setTime(){"
+            "  var now=new Date();"
+            "  var utc=Math.floor(Date.now()/1000);"
+            "  var tz=-now.getTimezoneOffset();"
+            "  fetch('/settime?t='+utc+'&tz='+tz).then(r=>r.json()).then(j=>{"
+            "    alert(j.ok?'RTC set to '+now.toLocaleString():'Error: '+j.err);"
+            "  }).catch(()=>alert('Set time request failed'));"
+            "}"
+            "function clearLogs(){"
+            "  if(!confirm('Delete ALL log files from SD card?\\nThis cannot be undone.'))return;"
+            "  fetch('/clearlog').then(r=>r.json()).then(j=>{"
+            "    alert(j.ok?'Deleted '+j.deleted+' log file(s).':'Error: '+j.err);"
+            "    poll();"
+            "  }).catch(()=>alert('Clear logs request failed'));"
+            "}"
             // Page switch
             "function pg(p){"
             "CP=p;"
@@ -971,7 +1189,8 @@ private:
             "if(dw)dw.className='dot on';"
             "const dl=document.getElementById('dLog');"
             "if(dl)dl.className=d.usb?'dot on':'dot off';"
-            "st('logstat',d.usb?d.logrows+' rows':'---');"
+            "var ts=d.ts&&d.ts.length>0?'  '+d.ts:'';"
+            "st('logstat',d.usb?d.logrows+' rows'+ts:'No SD'+ts);"
             "}"));
 
         // ── JavaScript: control functions ─────────────────────────────────────

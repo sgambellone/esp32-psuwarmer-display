@@ -41,6 +41,8 @@ static unsigned long _lastPSUms       = 0;
 static unsigned long _lastLogms       = 0;
 static unsigned long _lastWiFims      = 0;
 static unsigned long _lastCrowPanelms = 0;
+static uint32_t      _rtcEpoch     = 0;   // Unix epoch received from CrowPanel RTC
+static unsigned long _rtcBootMs    = 0;   // millis() when epoch was last synced
 static unsigned long _lastDiagms      = 0;
 static unsigned long _lastBMEms       = 0;
 static uint8_t       _initPhase       = 0;
@@ -76,16 +78,23 @@ static bool channelChanged(const HeatingChannel& ch, const ChSnapshot& snap) {
 static void sendCrowPanelTelemetry() {
     float t1 = isnan(ch1.displayTempF) ? -999.0f : ch1.displayTempF;
     float t2 = isnan(ch2.displayTempF) ? -999.0f : ch2.displayTempF;
+    // Compute current epoch from last RTC sync + elapsed millis
+    uint32_t nowEpoch = (_rtcEpoch > 0)
+        ? _rtcEpoch + (uint32_t)((millis() - _rtcBootMs) / 1000)
+        : 0;
+
     char buf[320];
     int len = snprintf(buf, sizeof(buf),
         "{\"c1\":{\"t\":%.1f,\"s\":%.1f,\"d\":%d,\"st\":\"%s\",\"r\":%.2f},"
          "\"c2\":{\"t\":%.1f,\"s\":%.1f,\"d\":%d,\"st\":\"%s\",\"r\":%.2f},"
          "\"psu\":{\"v\":%.2f,\"a\":%.2f,\"w\":%.1f,\"vin\":%.1f,\"sv\":%.2f,"
-                  "\"on\":%d,\"cc\":%d,\"ok\":%d}",
+                  "\"on\":%d,\"cc\":%d,\"ok\":%d},"
+         "\"ts\":%lu",
         t1, ch1.setpointF, (int)(ch1.duty*100.0f), ch1.statusStr(), ch1.dTdtF * 60.0f,
         t2, ch2.setpointF, (int)(ch2.duty*100.0f), ch2.statusStr(), ch2.dTdtF * 60.0f,
         psu.measV, psu.measA, psu.measW, psu.inputV, psu.setV,
-        psu.outputOn?1:0, psu.isCC?1:0, psu.commsOk?1:0);
+        psu.outputOn?1:0, psu.isCC?1:0, psu.commsOk?1:0,
+        (unsigned long)nowEpoch);
     // Append env field only when BME680 has valid seeded data
     if (_bmeOk && _bmeSeeded && len > 0 && len < (int)sizeof(buf) - 60) {
         len += snprintf(buf + len, sizeof(buf) - len,
@@ -117,6 +126,26 @@ static void handleCrowPanelCommand(char* buf) {
     else if (strcmp(cmd, "c1_en")  == 0) ch1.enabled = (v > 0.5f);
     else if (strcmp(cmd, "c2_sp")  == 0) ch2.adjustSetpoint(v - ch2.setpointF);
     else if (strcmp(cmd, "c2_en")  == 0) ch2.enabled = (v > 0.5f);
+    else if (strcmp(cmd, "set_rtc") == 0) {
+        // Web GUI → Feather → CrowPanel: CrowPanel confirms RTC written
+        // (No action needed here — web GUI already updated _rtcEpoch via poll)
+    }
+    else if (strcmp(cmd, "rtc_epoch") == 0) {
+        // Parse directly as uint32_t — float path loses precision on 10-digit epochs.
+        // millis() is captured at exact receipt time as the clock reference.
+        // This is the canonical source of truth — not overwritten by loop polling.
+        const char* ep = strstr(buf, "\"v\":");
+        uint32_t rxEpoch = ep ? (uint32_t)atol(ep + 4) : 0;
+        if (rxEpoch > 1577836800UL) {  // sanity: after Jan 2020
+            _rtcEpoch  = rxEpoch;
+            _rtcBootMs = millis();
+            logger.setEpoch(_rtcEpoch, _rtcBootMs);
+            DBG_PRINTF("[rtc] epoch %lu synced (ms ref=%lu)\n",
+                       (unsigned long)_rtcEpoch, _rtcBootMs);
+        } else {
+            DBG_PRINTF("[rtc] rtc_epoch rejected: %lu\n", (unsigned long)rxEpoch);
+        }
+    }
     else DBG_PRINTF("[panel] Unknown cmd: %s\n", cmd);
 }
 
@@ -219,6 +248,7 @@ void loop() {
         wifiSrv.begin();
         wifiSrv.setLogger(&logger);
         wifiSrv.setPsu(&psu);
+        wifiSrv.setCrowPanelSerial(&Serial2);
         logger.flush();
         _initPhase = 2;
         Serial.println("[wifi] HTTP server listening");
@@ -305,6 +335,7 @@ void loop() {
         float t1 = isnan(ch1.displayTempF) ? -999.0f : ch1.displayTempF;
         float t2 = isnan(ch2.displayTempF) ? -999.0f : ch2.displayTempF;
         logger.log(now,
+                   _rtcEpoch > 0 ? _rtcEpoch + (uint32_t)((millis() - _rtcBootMs) / 1000) : 0,
             t1, ch1.setpointF, ch1.duty, ch1.ffTerm(), ch1.dTdtF, ch1.statusStr(),
             t2, ch2.setpointF, ch2.duty, ch2.ffTerm(), ch2.dTdtF, ch2.statusStr(),
             psu.measV, psu.measA, psu.measW, psu.inputV, psu.setV,
@@ -329,6 +360,23 @@ void loop() {
     // ── HTTP server poll ──────────────────────────────────────────────────────
     if (_initPhase >= 2 && now - _lastWiFims >= WIFI_POLL_MS) {
         wifiSrv.poll(&ch1, &ch2);
+        // Keep web server epoch in sync
+        // Pick up epoch set via web GUI /settime (server stores it separately)
+        // Pick up epoch set via web GUI /settime
+        uint32_t webEpoch = wifiSrv.rtcSetEpoch();
+        if (webEpoch > 0 && webEpoch != _rtcEpoch) {
+            // Use current millis() as reference — rtcSetMs() is stale by
+            // the time we poll it, which would cause the clock to jump ahead.
+            // webEpoch is already timezone-adjusted from the browser JS.
+            _rtcEpoch  = webEpoch;
+            _rtcBootMs = millis();
+            logger.setEpoch(_rtcEpoch, _rtcBootMs);
+            DBG_PRINTF("[rtc] epoch from web GUI: %lu\n", (unsigned long)_rtcEpoch);
+        }
+        // Update web server display epoch — lightweight, just two assignments
+        if (_rtcEpoch > 0) wifiSrv.setCurrentEpoch(_rtcEpoch, _rtcBootMs);
+        // Note: logger.setEpoch() is NOT called here — calling it every loop
+        // iteration resets _epochMs to now, preventing the clock from advancing.
         _lastWiFims = now;
     }
 

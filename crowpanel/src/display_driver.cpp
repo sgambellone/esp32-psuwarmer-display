@@ -23,10 +23,18 @@
 #include "display_driver.h"
 #include <lvgl.h>
 #include <Wire.h>
+#include <time.h>
 #include <driver/gpio.h>
+#include <esp_system.h>
 // Wire  = I2C_NUM_0 — used by LovyanGFX for GT911 touch
 // Wire1 = I2C_NUM_1 — dedicated to STC8H1K28 backlight, no LovyanGFX conflict
 static TwoWire WireBL(1);  // I2C_NUM_1 on GPIO15/16 for backlight only
+
+// RTC epoch read at boot (before tft.begin). Zero = RTC not set.
+// Retrieved by main.cpp via display_get_boot_epoch() after display_driver_init().
+static uint32_t _bootEpoch = 0;
+uint32_t display_get_boot_epoch() { return _bootEpoch; }
+static uint32_t display_rtc_read();  // defined later in this file
 
 // ── LovyanGFX LGFX class ──────────────────────────────────────────────────────
 class LGFX : public lgfx::LGFX_Device {
@@ -134,7 +142,7 @@ public:
             cfg.i2c_addr  = 0x5D;
             cfg.pin_sda   = GPIO_NUM_15;  // GT911 I2C — shared with backlight STC8H1K28
             cfg.pin_scl   = GPIO_NUM_16;
-            cfg.freq      = 400000;
+            cfg.freq      = 100000;   // 100kHz — GT911 signals too weak at 400kHz under load;
             _touch_instance.config(cfg);
             _panel_instance.setTouch(&_touch_instance);
         }
@@ -193,7 +201,41 @@ static void lvgl_touch_read(lv_indev_drv_t* drv, lv_indev_data_t* data) {
 static void lvgl_log(const char* buf) { Serial.print(buf); }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-void display_driver_init() {
+
+// Write epoch to PCF8563 via WireBL — ONLY safe to call before tft.begin().
+// After tft.begin(), LovyanGFX reconfigures GPIO15/16 for GT911 (I2C_NUM_0).
+// Never call this post-init; use NVS to defer the write to next boot instead.
+static void _rtcWrite_safe(uint32_t epoch) {
+    time_t t = (time_t)epoch;
+    struct tm* tm_info = gmtime(&t);
+    if (!tm_info) { Serial.println("[rtc] write: gmtime failed"); return; }
+    auto bcd = [](uint8_t d) -> uint8_t { return ((d/10) << 4) | (d%10); };
+
+    // First clear the control/status registers to ensure oscillator is running
+    // and the VL (Voltage Low) flag will be cleared when we write time.
+    // Register 0x00 (Control_Status_1) and 0x01 (Control_Status_2) = 0 = normal run mode.
+    WireBL.beginTransmission(0x51);
+    WireBL.write(0x00);  // start at Control_Status_1
+    WireBL.write(0x00);  // Control_Status_1: normal mode, no test
+    WireBL.write(0x00);  // Control_Status_2: no interrupts
+    WireBL.endTransmission();
+
+    // Now write time registers — VL bit (0x80) must be 0 to clear it
+    WireBL.beginTransmission(0x51);
+    WireBL.write(0x02);                                   // seconds register
+    WireBL.write(bcd(tm_info->tm_sec)  & 0x7F);          // bit7=VL=0 clears the flag
+    WireBL.write(bcd(tm_info->tm_min)  & 0x7F);
+    WireBL.write(bcd(tm_info->tm_hour) & 0x3F);
+    WireBL.write(bcd(tm_info->tm_mday) & 0x3F);
+    WireBL.write(0);                                      // weekday — not used
+    WireBL.write(bcd(tm_info->tm_mon + 1) & 0x1F);
+    WireBL.write(bcd(tm_info->tm_year % 100));
+    uint8_t err = WireBL.endTransmission();
+    Serial.printf("[rtc] write epoch %lu: %s\n",
+                  (unsigned long)epoch, err == 0 ? "OK" : "FAILED");
+}
+
+void display_driver_init(uint32_t pendingRtcEpoch) {
     Serial.println("[display] Init...");
 
     if (psramFound()) {
@@ -213,18 +255,21 @@ void display_driver_init() {
     WireBL.begin(15, 16);  // I2C_NUM_1 — dedicated to backlight, never touched by LovyanGFX
     Serial.println("[display] WireBL init done (GPIO15/16, I2C_NUM_1)");
 
-    // SC7277 is the 7" board driver — the 5" Advance uses ST7262 (pure RGB).
-    // Scanning to confirm STC8H1K28 backlight (0x30), RTC (0x51), GT911 (0x5D).
-    // 200ms delay gives all I2C devices time to complete power-on sequencing.
-    delay(200);
-    Serial.print("[display] I2C scan GPIO15/GPIO16 (WireBL):");
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        WireBL.beginTransmission(addr);
-        if (WireBL.endTransmission() == 0) {
-            Serial.printf(" 0x%02X", addr);
-        }
+    // On cold power-up the GT911 touch controller needs ~200ms from VCC stable
+    // to complete its internal power-on sequence before it can accept I2C.
+    // On a software reset GT911 keeps power and is already initialised so a
+    // short delay is fine.  Probing the I2C bus (even to other addresses) while
+    // GT911 is in its power-on init can corrupt its I2C address selection and
+    // permanently break touch until the next cold power-up.
+    // The I2C scan that used to live here was removed for this reason — it hit
+    // address 0x5D (GT911) during the cold-start window on every power cycle.
+    {
+        // esp_reset_reason() lets us give GT911 extra settling time only when
+        // it actually needs it (cold power-on), keeping boot fast after reset.
+        uint32_t settleMs = (esp_reset_reason() == ESP_RST_POWERON) ? 500 : 100;
+        Serial.printf("[display] GT911 settle delay: %lums\n", (unsigned long)settleMs);
+        delay(settleMs);
     }
-    Serial.println();
 
     // NOTE: The ST7262 display IC is pure RGB — no I2C init needed at all.
     // STC8H1K28 backlight controller at I2C 0x30 — V1.1 protocol:
@@ -238,6 +283,22 @@ void display_driver_init() {
     uint8_t blErr = WireBL.endTransmission();
     Serial.printf("[display] Backlight MAX (0x10): %s\n",
                   blErr == 0 ? "OK" : "FAILED");
+
+    // Write RTC if a pending epoch was deferred from last session via NVS.
+    // With GT911 running at 100kHz, the I2C bus is stable enough for this.
+    // Sanity check prevents writing a corrupt epoch to the PCF8563.
+    if (pendingRtcEpoch > 1577836800UL) {
+        _rtcWrite_safe(pendingRtcEpoch);
+    }
+
+    // Read PCF8563 — confirms write succeeded and captures battery-backed time
+    _bootEpoch = display_rtc_read();
+
+    // Release WireBL (I2C_NUM_1) from GPIO15/16 BEFORE tft.begin().
+    // LovyanGFX needs to cleanly claim those pins for GT911 (I2C_NUM_0).
+    // Without this, I2C_NUM_1 retains GPIO matrix routing and GT911 init
+    // fails on cold power-up (but not on reset where the matrix is re-init'd).
+    WireBL.end();
 
     tft.begin();
     tft.setRotation(0);
@@ -367,4 +428,67 @@ void display_set_brightness(uint8_t level) {
     else if (level < 205)  reg = 0x09;  // ~80%
     else                   reg = 0x10;  // 100%
     bl_i2c_write(0x30, reg);
+}
+
+// ── PCF8563 RTC (0x51) — read via WireBL before tft.begin() ─────────────────
+// Returns Unix epoch (UTC) or 0 if RTC not set / not responding.
+// Call from main.cpp during setup, after display_init() but WireBL is
+// initialised inside display_init() so this works immediately after.
+// NOTE: WireBL (I2C_NUM_1) is used here — it never conflicts with LovyanGFX
+// which uses I2C_NUM_0 for GT911.  Safe to call at any time post-init.
+static uint8_t _bcd2dec(uint8_t b) { return (b >> 4) * 10 + (b & 0x0F); }
+
+uint32_t display_rtc_read() {
+    // Use endTransmission(true) — always sends STOP even on NACK.
+    // endTransmission(false) leaves the bus without STOP if PCF8563 NACKs
+    // (e.g. cold power-up before chip is ready), which sticks SDA low and
+    // prevents GT911 from initialising inside the subsequent tft.begin().
+    WireBL.beginTransmission(0x51);
+    WireBL.write(0x02);  // start at seconds register
+    if (WireBL.endTransmission(true) != 0) {   // true = send STOP regardless
+        Serial.println("[rtc] PCF8563 not responding");
+        return 0;
+    }
+    WireBL.requestFrom((uint8_t)0x51, (uint8_t)7);
+    if (WireBL.available() < 7) { Serial.println("[rtc] short read"); return 0; }
+    uint8_t sec_raw = WireBL.read();
+    // Bit 7 of seconds register is the Voltage Low (VL) flag.
+    // When set, the chip lost power and time integrity is not guaranteed.
+    // This is the case on first power-up before any time has been written.
+    if (sec_raw & 0x80) {
+        for (int i = 0; i < 6; i++) WireBL.read();  // drain remaining bytes
+        Serial.println("[rtc] PCF8563 VL flag set — time not reliable");
+        return 0;
+    }
+    uint8_t sec = _bcd2dec(sec_raw & 0x7F);
+    uint8_t min = _bcd2dec(WireBL.read() & 0x7F);
+    uint8_t hr  = _bcd2dec(WireBL.read() & 0x3F);
+    uint8_t day = _bcd2dec(WireBL.read() & 0x3F);
+    WireBL.read();                                   // weekday — skip
+    uint8_t mon = _bcd2dec(WireBL.read() & 0x1F);
+    uint8_t yr  = _bcd2dec(WireBL.read());          // years since 2000
+    struct tm t = {};
+    t.tm_sec = sec; t.tm_min = min; t.tm_hour = hr;
+    t.tm_mday = day; t.tm_mon = mon - 1; t.tm_year = 100 + yr;
+    time_t epoch = mktime(&t);
+    Serial.printf("[rtc] %04d-%02d-%02d %02d:%02d:%02d UTC (epoch=%lu)\n",
+                  2000+yr, mon, day, hr, min, sec, (unsigned long)epoch);
+    return (epoch > 0) ? (uint32_t)epoch : 0;
+}
+
+// ── display_rtc_write() — write epoch to PCF8563 at runtime ──────────────────
+// Safe to call after tft.begin() by temporarily suspending LVGL touch polling.
+// Caller must disable/re-enable the LVGL input device around this call.
+// WireBL is re-initialized briefly for the write then ended to release GPIO15/16.
+void display_rtc_write(uint32_t epoch) {
+    if (epoch < 1577836800UL) {
+        Serial.printf("[rtc] display_rtc_write: epoch %lu rejected\n",
+                      (unsigned long)epoch);
+        return;
+    }
+    // Brief WireBL init — safe because LVGL touch is suspended by caller
+    WireBL.begin(15, 16);
+    _rtcWrite_safe(epoch);
+    WireBL.end();
+    Serial.printf("[rtc] runtime write epoch %lu done\n", (unsigned long)epoch);
 }

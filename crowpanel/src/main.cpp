@@ -27,12 +27,45 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <Preferences.h>
+#include <time.h>
+#include <driver/gpio.h>
 #include "display_driver.h"
 
 // Forward declaration for GT911 hardware drain (defined in display_driver.cpp)
 void display_drain_touch();
 void display_buzzer(bool on);
 void display_speaker(bool on);
+uint32_t display_get_boot_epoch();         // RTC epoch read before tft.begin()
+void     display_driver_init(uint32_t pendingRtcEpoch = 0);
+void     display_rtc_write(uint32_t epoch); // write PCF8563 at runtime (touch suspended)
+
+// ── RTC state ─────────────────────────────────────────────────────────────────
+static uint32_t _rtcBootEpoch = 0;  // Unix epoch at boot (0 = not set) — always UTC
+static uint32_t _rtcBootMs   = 0;  // millis() when epoch was captured
+static int32_t  _tzOffsetMin  = 0;  // local timezone offset in minutes east of UTC
+static char     _rtcTimeStr[20] = "--:--";  // HH:MM for header display
+static lv_obj_t* _timeLbl = nullptr;  // unused in header; kept for rtcWrite() guard
+
+static bool _featherEpochAcked = false;  // true once Feather echoes back valid ts
+
+// Format current local date+time into buf — applies _tzOffsetMin to UTC epoch
+static void _fmtNowDatetime(char* buf, size_t len) {
+    if (_rtcBootEpoch == 0) { strncpy(buf, "--/-- --:--", len); return; }
+    uint32_t nowUtc = _rtcBootEpoch + (uint32_t)((millis() - _rtcBootMs) / 1000);
+    // Apply timezone: offset is minutes east of UTC (negative = west, e.g. EDT = -240)
+    int32_t  localEpoch = (int32_t)nowUtc + (_tzOffsetMin * 60);
+    time_t t = (time_t)(localEpoch > 0 ? localEpoch : 0);
+    struct tm* tm = gmtime(&t);  // gmtime on the offset-adjusted value gives local time
+    if (tm) snprintf(buf, len, "%02d/%02d %02d:%02d",
+                     tm->tm_mon+1, tm->tm_mday, tm->tm_hour, tm->tm_min);
+    else strncpy(buf, "--/-- --:--", len);
+}
+
+static uint8_t bcd2dec(uint8_t b) { return (b >> 4) * 10 + (b & 0x0F); }
+static uint8_t dec2bcd(uint8_t d) { return ((d / 10) << 4) | (d % 10); }
+
+// rtcWrite() removed — PCF8563 writes must only happen
+// in the pre-tft.begin() window (display_driver_init). See display_driver.cpp.
 
 // ── UART ──────────────────────────────────────────────────────────────────────
 // Feather link uses UART1-OUT connector (IO20-TX1 / IO19-RX1). Neither pin
@@ -287,6 +320,22 @@ static void parseTelemetry(char* buf) {    // Channel objects
             env.valid    = true;
         }
     }
+    // Timestamp from Feather — use if CrowPanel has no valid epoch yet.
+    // Feather broadcasts ts every 200ms so after any reset the clock is
+    // restored within one telemetry cycle without touching GPIO15/16.
+    const char* tsp = strstr(buf, "\"ts\":");
+    if (tsp) {
+        uint32_t featherEpoch = (uint32_t)atol(tsp + 5);
+        if (featherEpoch > 1700000000UL) {
+            _featherEpochAcked = true;  // Feather has a valid epoch — stop resending
+            if (_rtcBootEpoch == 0) {
+                _rtcBootEpoch = featherEpoch;
+                _rtcBootMs    = millis();
+                Serial.printf("[rtc] epoch %lu from Feather telemetry\n",
+                              (unsigned long)_rtcBootEpoch);
+            }
+        }
+    }
 }
 
 // ── Style helpers ─────────────────────────────────────────────────────────────
@@ -361,6 +410,23 @@ static void showPage(Page p) {
     lv_obj_add_flag(_pagePsu,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(_pageWarm, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(_pageEnv,  LV_OBJ_FLAG_HIDDEN);
+    // Swap header right label between env summary and date/time
+    if (_envLbl) {
+        char hdrBuf[32];
+        if (p == PAGE_ENV) {
+            _fmtNowDatetime(hdrBuf, sizeof(hdrBuf));
+            lv_label_set_text(_envLbl, hdrBuf);
+            lv_obj_set_style_text_font(_envLbl, &lv_font_montserrat_24, 0);
+        } else {
+            if (env.valid)
+                snprintf(hdrBuf, sizeof(hdrBuf), "%.1f\xC2\xB0  %.1f%%",
+                         env.tempF, env.humidity);
+            else
+                strncpy(hdrBuf, "---", sizeof(hdrBuf));
+            lv_label_set_text(_envLbl, hdrBuf);
+            lv_obj_set_style_text_font(_envLbl, &lv_font_montserrat_24, 0);
+        }
+    }
     switch (p) {
         case PAGE_DASH: lv_obj_clear_flag(_pageDash, LV_OBJ_FLAG_HIDDEN); break;
         case PAGE_PSU:  lv_obj_clear_flag(_pagePsu,  LV_OBJ_FLAG_HIDDEN); break;
@@ -1109,7 +1175,7 @@ static void onBrightness(lv_event_t*) {
 
 // ── IAQ helpers (used by updateUI and buildEnvPage) ──────────────────────────
 static const char* iaqLabel(float kohm) {
-    if (kohm >= 300.f) return "Excellent";
+    if (kohm >= 300.f) return "Excllnt";
     if (kohm >= 150.f) return "Good";
     if (kohm >=  50.f) return "Fair";
     if (kohm >=  25.f) return "Poor";
@@ -1126,8 +1192,13 @@ static lv_color_t iaqColor(float kohm) {
 static void updateUI() {
     char buf[40];
 
-    // Header env label (temp + humidity summary)
-    if (env.valid) {
+    // Header env label — shows temp/humidity on all pages EXCEPT ENV tab,
+    // which uses this label to display the current date/time instead.
+    if (_curPage == PAGE_ENV) {
+        char dtBuf[20];
+        _fmtNowDatetime(dtBuf, sizeof(dtBuf));
+        setLbl(_envLbl, dtBuf);
+    } else if (env.valid) {
         snprintf(buf, sizeof(buf), "%.1f\xC2\xB0  %.1f%%", env.tempF, env.humidity);
         setLbl(_envLbl, buf);
     }
@@ -1397,7 +1468,7 @@ static void buildEnvPage() {
         const int RH  = 26;
         const int TY0 = (IH - 5 * RH) / 2;
 
-        const char* tl[5] = {"Excellent","Good","Fair","Poor","Bad"};
+        const char* tl[5] = {"Excllnt","Good","Fair","Poor","Bad"};
         const char* tt[5] = {">300",">150",">50",">25","<25"};
         lv_color_t  tc[5] = {C_GREEN, lv_color_hex(0x55ccaa), C_AMBER, C_ACCENT, C_RED};
 
@@ -1557,7 +1628,29 @@ void setup() {
 
     FeatherPort.begin(FEATHER_BAUD, SERIAL_8N1, FEATHER_RX_PIN, FEATHER_TX_PIN);
 
-    display_driver_init();
+    // ── Time init ─────────────────────────────────────────────────────────────
+    // PCF8563 is written immediately on Set Time (runtime write, touch suspended).
+    // NVS only holds the timezone offset. No epoch staging needed.
+    _tzOffsetMin = _prefs.getInt("rtcTz", 0);
+    display_driver_init(0);
+
+    uint32_t bootEpoch = display_get_boot_epoch();
+    if (bootEpoch > 0) {
+        _rtcBootEpoch = bootEpoch;
+        _rtcBootMs    = millis();
+        int32_t localEp = (int32_t)bootEpoch + (_tzOffsetMin * 60);
+        time_t t = (time_t)(localEp > 0 ? localEp : 0);
+        struct tm* tm_info = gmtime(&t);
+        if (tm_info) snprintf(_rtcTimeStr, sizeof(_rtcTimeStr),
+                              "%02d:%02d", tm_info->tm_hour, tm_info->tm_min);
+        FeatherPort.printf("{\"cmd\":\"rtc_epoch\",\"v\":%lu}\n",
+                           (unsigned long)bootEpoch);
+        Serial.printf("[rtc] boot UTC=%lu tz=%dmin\n",
+                      (unsigned long)bootEpoch, _tzOffsetMin);
+    } else {
+        Serial.println("[rtc] PCF8563 empty — click Set Time in web GUI");
+    }
+
     buildUI();
 
     // Run 20 render cycles to pre-populate the PSRAM framebuffer before the
@@ -1619,8 +1712,38 @@ void loop() {
         if (c == '\n') {
             _rxBuf[_rxPos] = '\0';
             if (_rxPos > 10) {
-                parseTelemetry(_rxBuf);
-                _gotData = true;
+                if (strstr(_rxBuf, "set_rtc")) {
+                    const char* vp = strstr(_rxBuf, "\"v\":");
+                    const char* tp = strstr(_rxBuf, "\"tz\":");
+                    if (vp) {
+                        uint32_t rxEpoch = (uint32_t)atol(vp + 4);
+                        int32_t  rxTz    = tp ? (int32_t)atol(tp + 5) : _tzOffsetMin;
+                        if (rxEpoch < 1577836800UL) {
+                            Serial.printf("[rtc] set_rtc epoch %lu rejected\n",
+                                          (unsigned long)rxEpoch);
+                        } else {
+                            _rtcBootEpoch = rxEpoch;
+                            _rtcBootMs    = millis();
+                            _tzOffsetMin  = rxTz;
+                            // Write PCF8563 immediately — suspend touch briefly so
+                            // WireBL can safely use GPIO15/16 without GT911 conflict
+                            lv_indev_t* indev = lv_indev_get_next(NULL);
+                            if (indev) lv_indev_enable(indev, false);
+                            display_rtc_write(rxEpoch);
+                            if (indev) lv_indev_enable(indev, true);
+                            // Store tz in NVS (epoch no longer needed — chip owns it)
+                            _prefs.putInt("rtcTz", _tzOffsetMin);
+                            // Echo to Feather
+                            FeatherPort.printf("{\"cmd\":\"rtc_epoch\",\"v\":%lu}\n",
+                                               (unsigned long)_rtcBootEpoch);
+                            Serial.printf("[rtc] set utc=%lu tz=%dmin, chip written\n",
+                                          (unsigned long)_rtcBootEpoch, _tzOffsetMin);
+                        }
+                    }
+                } else {
+                    parseTelemetry(_rxBuf);
+                    _gotData = true;
+                }
             }
             _rxPos = 0;
         } else if (_rxPos < (int)sizeof(_rxBuf) - 1) {
@@ -1633,7 +1756,19 @@ void loop() {
     // widgets get re-rendered.
     if (_gotData) updateUI();
 
-    // ── Process touch + render dirty regions ─────────────────────────────────
-    display_driver_tick();   // no-op — waitDisplay is in flush callback
+    // ── Periodic rtc_epoch resend until Feather acknowledges ──────────────────
+    // The one-shot send during setup() is often missed because the Feather's
+    // loop() hasn't started processing Serial2 yet. Resend every 3 seconds
+    // until the Feather echoes back a non-zero ts field in telemetry.
+    static uint32_t _lastEpochSendMs = 0;
+    if (!_featherEpochAcked && _rtcBootEpoch > 0 &&
+        millis() - _lastEpochSendMs > 3000UL) {
+        uint32_t nowEp = _rtcBootEpoch + (uint32_t)((millis() - _rtcBootMs) / 1000);
+        FeatherPort.printf("{\"cmd\":\"rtc_epoch\",\"v\":%lu}\n",
+                           (unsigned long)nowEp);
+        _lastEpochSendMs = millis();
+    }
+
+    display_driver_tick();
     lv_timer_handler();
 }
